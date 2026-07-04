@@ -54,7 +54,7 @@ export async function getAvailableFiles() {
 export async function getFileByName(filename: string) {
   const { data, error } = await supabase
     .from('files')
-    .select('r2_key, mime_type')
+    .select('filename, r2_key, mime_type')
     .ilike('filename', `%${filename}%`) // Case insensitive partial match
     .limit(1)
     .single();
