@@ -1,10 +1,19 @@
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// Use service role key to bypass RLS in the server environment
-export const supabase = createClient(supabaseUrl, supabaseServiceKey);
+// Use service role key to bypass RLS in the server environment.
+// Fall back to a Proxy during build-time (or when variables are missing) to avoid crashing compilation.
+export const supabase = (supabaseUrl && supabaseServiceKey)
+  ? createClient(supabaseUrl, supabaseServiceKey)
+  : new Proxy({} as any, {
+      get(target, prop) {
+        throw new Error(
+          `Supabase client was accessed but environment variables (NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY) are missing.`
+        );
+      }
+    });
 
 export async function isAdmin(phoneNumber: string): Promise<boolean> {
   const { data, error } = await supabase

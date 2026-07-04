@@ -5,7 +5,8 @@ import { uploadFileToR2, getSignedDownloadUrl } from '@/lib/r2';
 import { processUserIntent } from '@/lib/ai';
 
 // Vercel serverless function max duration (Hobby plan is restricted to 10s anyway, but this is good practice if upgraded)
-export const maxDuration = 10; 
+export const maxDuration = 10;
+export const dynamic = 'force-dynamic';
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 
