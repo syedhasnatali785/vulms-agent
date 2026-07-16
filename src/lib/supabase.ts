@@ -73,7 +73,7 @@ export async function saveFileMetadata(filename: string, r2Key: string, mimeType
     }
   }
 
-  // Try 2: Drop message_id (in case message_id is missing or causing error)
+  // Try 2: Drop message_id (in case message_id column is missing)
   const insertData2: any = { filename, r2_key: r2Key, mime_type: mimeType, uploaded_by: uploadedBy };
   res = await supabase.from('files').insert([insertData2]).select();
   if (!res.error && res.data && res.data.length > 0) {
@@ -87,7 +87,7 @@ export async function saveFileMetadata(filename: string, r2Key: string, mimeType
     }
   }
 
-  // Try 3: Drop uploaded_by (in case uploaded_by is missing or has foreign key constraint issues)
+  // Try 3: Drop uploaded_by (in case uploaded_by has foreign key constraint issues)
   const insertData3: any = { filename, r2_key: r2Key, mime_type: mimeType };
   res = await supabase.from('files').insert([insertData3]).select();
   if (!res.error && res.data && res.data.length > 0) {
@@ -118,12 +118,11 @@ export async function getFileByName(filename: string) {
   const { data, error } = await supabase
     .from('files')
     .select('id, filename, r2_key, mime_type')
-    .ilike('filename', `%${filename}%`) // Case insensitive partial match
-    .limit(1)
-    .single();
+    .ilike('filename', `%${filename}%`)
+    .limit(1);
 
-  if (error) return null;
-  return data;
+  if (error || !data || data.length === 0) return null;
+  return data[0];
 }
 
 export async function getFileByIdOrNameOrMessageId(query: string) {
@@ -164,50 +163,35 @@ export async function getFileByIdOrNameOrMessageId(query: string) {
   return data[0];
 }
 
-export function extractKeywords(text: string): string[] {
+/**
+ * Extracts course codes from text.
+ * Matches patterns like: ENG201, eng 201, ENG-201, eng_201, CS 101, mth301
+ * Returns multiple format variants so DB ilike can match filenames like "ENG201_Handouts_Final.pdf"
+ * 
+ * IMPORTANT: This only extracts course codes, NOT random English words.
+ * Random word extraction caused false-positive file matches on every message.
+ */
+export function extractCourseKeywords(text: string): string[] {
+  const coursePattern = /\b([a-zA-Z]{2,5})\s*[-_]?\s*(\d{2,4})\b/gi;
   const keywords = new Set<string>();
-  
-  // 1. Extract course codes (e.g., CS101, ENG 201, MTH-301, etc.)
-  const coursePattern = /\b([a-zA-Z]{2,4})\s*[-_]?\s*(\d{3})\b/gi;
   let match;
   while ((match = coursePattern.exec(text)) !== null) {
     const prefix = match[1].toLowerCase();
     const num = match[2];
-    keywords.add(`${prefix}${num}`);
-    keywords.add(`${prefix} ${num}`);
-    keywords.add(`${prefix}-${num}`);
-    keywords.add(`${prefix}_${num}`);
+    // Add all format variants so ilike can match any naming convention
+    keywords.add(`${prefix}${num}`);       // eng201
+    keywords.add(`${prefix} ${num}`);      // eng 201
+    keywords.add(`${prefix}-${num}`);      // eng-201
+    keywords.add(`${prefix}_${num}`);      // eng_201
+    keywords.add(`${prefix.toUpperCase()}${num}`);   // ENG201
+    keywords.add(`${prefix.toUpperCase()}_${num}`);  // ENG_201
   }
-
-  // 2. Extract other significant words (length >= 3, not common stop words)
-  const stopWords = new Set([
-    'the', 'and', 'for', 'you', 'get', 'please', 'send', 'file', 'retrieve', 
-    'download', 'with', 'from', 'this', 'that', 'here', 'your', 'find', 'show', 
-    'give', 'need', 'want', 'search', 'look', 'matching', 'handout', 'handouts'
-  ]);
-  
-  const words = text.split(/[^a-zA-Z0-9_-]+/);
-  for (const w of words) {
-    const cleanWord = w.toLowerCase().trim();
-    if (cleanWord.length >= 3 && !stopWords.has(cleanWord) && !/^\d+$/.test(cleanWord)) {
-      keywords.add(cleanWord);
-      if (cleanWord.includes('_') || cleanWord.includes('-')) {
-        const parts = cleanWord.split(/[_-]+/);
-        for (const p of parts) {
-          if (p.length >= 3 && !stopWords.has(p)) {
-            keywords.add(p);
-          }
-        }
-      }
-    }
-  }
-
   return Array.from(keywords);
 }
 
-// Keep extractCourseKeywords for compatibility
-export function extractCourseKeywords(text: string): string[] {
-  return extractKeywords(text);
+// Alias for backward compatibility
+export function extractKeywords(text: string): string[] {
+  return extractCourseKeywords(text);
 }
 
 export async function getFilesByKeywords(keywords: string[]) {
@@ -236,4 +220,3 @@ export async function getFilesByKeywords(keywords: string[]) {
   }
   return allFiles;
 }
-

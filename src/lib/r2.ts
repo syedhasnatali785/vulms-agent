@@ -40,3 +40,10 @@ export async function getSignedDownloadUrl(key: string, expiresIn = 3600): Promi
 export function getPublicUrl(key: string): string {
   return `${process.env.R2_PUBLIC_URL}/${key}`;
 }
+
+export async function getFileUrl(key: string): Promise<string> {
+  if (process.env.R2_PUBLIC_URL) {
+    return getPublicUrl(key);
+  }
+  return await getSignedDownloadUrl(key);
+}

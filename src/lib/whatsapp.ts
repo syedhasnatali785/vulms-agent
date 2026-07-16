@@ -37,8 +37,12 @@ export async function sendMediaMessage(to: string, mediaType: 'image' | 'video' 
     };
 
     payload[mediaType] = { link: mediaUrl };
-    if (caption && mediaType !== 'document') {
-      payload[mediaType].caption = caption;
+    if (caption) {
+      if (mediaType === 'document') {
+        payload[mediaType].filename = caption;
+      } else {
+        payload[mediaType].caption = caption;
+      }
     }
 
     const response = await whatsappApi.post('/messages', payload);

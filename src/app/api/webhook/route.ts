@@ -1,8 +1,9 @@
 import { NextResponse } from 'next/server';
-import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractKeywords, getFilesByKeywords } from '@/lib/supabase';
+import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractCourseKeywords, getFilesByKeywords } from '@/lib/supabase';
 import { downloadWhatsAppMedia, sendTextMessage, sendMediaMessage } from '@/lib/whatsapp';
-import { uploadFileToR2, getSignedDownloadUrl } from '@/lib/r2';
+import { uploadFileToR2, getFileUrl } from '@/lib/r2';
 import { processUserIntent } from '@/lib/ai';
+import { searchGDriveFiles } from '@/lib/gdrive';
 
 // Vercel serverless function max duration (Hobby plan is restricted to 10s anyway, but this is good practice if upgraded)
 export const maxDuration = 10;
@@ -21,6 +22,24 @@ export async function GET(request: Request) {
   }
 
   return new NextResponse('Forbidden', { status: 403 });
+}
+
+/** Helper: resolve a local file record to a media message sent to the user */
+async function sendFileToUser(sender: string, file: any) {
+  const fileUrl = await getFileUrl(file.r2_key);
+  const mediaType = file.mime_type.startsWith('image') ? 'image'
+                   : file.mime_type.startsWith('video') ? 'video'
+                   : 'document' as const;
+  await sendMediaMessage(sender, mediaType, fileUrl, file.filename);
+}
+
+/** Helper: sends a Google Drive file directly as a media payload to WhatsApp without downloading it locally */
+async function sendGDriveFileToUser(sender: string, file: any) {
+  const fileUrl = `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media&key=${process.env.GOOGLE_API_KEY}`;
+  const mediaType = file.mimeType.startsWith('image') ? 'image'
+                   : file.mimeType.startsWith('video') ? 'video'
+                   : 'document' as const;
+  await sendMediaMessage(sender, mediaType, fileUrl, file.name);
 }
 
 export async function POST(request: Request) {
@@ -88,7 +107,7 @@ export async function POST(request: Request) {
           successMessage += `🆔 File ID: ${savedFile.id}\n`;
         }
         successMessage += `✉️ Message ID: ${messageId}\n\n` +
-          `You can retrieve this file anytime by typing "retrieve ${savedFile?.id || filename}" or "retrieve ${messageId}".`;
+          `You can retrieve this file anytime by typing its name or course code (e.g. "eng201").`;
         
         await sendTextMessage(sender, successMessage);
       } catch (e: any) {
@@ -102,81 +121,128 @@ export async function POST(request: Request) {
     if (message.type === 'text') {
       const text = message.text.body.trim();
 
-      // 2a. Direct file lookup (non-conversational messages)
-      // Check if the text itself matches a file ID, message ID, or filename directly
-      const isConversational = /^(hi|hello|hey|yes|no|ok|okay|help|admin|who|what|why|how|please|thank|thanks)\b/i.test(text);
-      if (!isConversational) {
-        const directFile = await getFileByIdOrNameOrMessageId(text);
-        if (directFile) {
+      // ── Step 2a: Explicit "retrieve/get/download <query>" commands ──
+      const retrieveMatch = text.match(/^(?:retrieve|get|download)\s+(.+)$/i);
+      if (retrieveMatch) {
+        const query = retrieveMatch[1].trim();
+        
+        // 1. Try Supabase first
+        const dbFile = await getFileByIdOrNameOrMessageId(query);
+        if (dbFile) {
           try {
-            const presignedUrl = await getSignedDownloadUrl(directFile.r2_key);
-            const mediaType = directFile.mime_type.startsWith('image') ? 'image' 
-                            : directFile.mime_type.startsWith('video') ? 'video' 
-                            : 'document';
-            await sendTextMessage(sender, `Found matching file: ${directFile.filename}`);
-            await sendMediaMessage(sender, mediaType, presignedUrl, directFile.filename);
-            return new NextResponse('OK', { status: 200 });
+            await sendTextMessage(sender, `Here is your file: ${dbFile.filename}`);
+            await sendFileToUser(sender, dbFile);
           } catch (err) {
-            console.error(`Error sending direct file ${directFile.filename}:`, err);
+            console.error("Error sending retrieved file:", err);
+            await sendTextMessage(sender, "Sorry, I found the file but failed to retrieve it from storage.");
           }
+          return new NextResponse('OK', { status: 200 });
         }
+
+        // 2. Try Google Drive (directly query and send download url)
+        const driveFiles = await searchGDriveFiles(query);
+        if (driveFiles.length > 0) {
+          const driveFile = driveFiles[0];
+          try {
+            await sendTextMessage(sender, `Here is your file: ${driveFile.name}`);
+            await sendGDriveFileToUser(sender, driveFile);
+          } catch (err) {
+            console.error("Error sending Google Drive file:", err);
+            await sendTextMessage(sender, "Sorry, I found the file on Google Drive but failed to send it.");
+          }
+          return new NextResponse('OK', { status: 200 });
+        }
+
+        await sendTextMessage(sender, `Sorry, I couldn't find any file matching "${query}".`);
+        return new NextResponse('OK', { status: 200 });
       }
 
-      // 2b. Automatic Keyword/Similarity Matching from Sentences
-      const keywords = extractKeywords(text);
-      if (keywords.length > 0) {
-        const matchingFiles = await getFilesByKeywords(keywords);
-        if (matchingFiles.length > 0) {
-          await sendTextMessage(sender, `Automatically found ${matchingFiles.length} file(s) matching your request:`);
-          for (const file of matchingFiles) {
+      // ── Step 2b: Course code keyword matching (e.g. "eng201", "send me CS 101 notes") ──
+      const courseKeywords = extractCourseKeywords(text);
+      if (courseKeywords.length > 0) {
+        const matchingDbFiles = await getFilesByKeywords(courseKeywords);
+        
+        // Query Google Drive matching files in real-time
+        const matchingDriveFiles: any[] = [];
+        for (const kw of courseKeywords) {
+          const driveFiles = await searchGDriveFiles(kw);
+          matchingDriveFiles.push(...driveFiles);
+        }
+        
+        // Deduplicate drive files by ID
+        const seenDriveIds = new Set<string>();
+        const uniqueDriveFiles = matchingDriveFiles.filter(f => {
+          if (seenDriveIds.has(f.id)) return false;
+          seenDriveIds.add(f.id);
+          return true;
+        });
+
+        const totalFilesCount = matchingDbFiles.length + uniqueDriveFiles.length;
+        if (totalFilesCount > 0) {
+          await sendTextMessage(sender, `Found ${totalFilesCount} file(s) matching your request:`);
+          
+          // Send Supabase files
+          for (const file of matchingDbFiles) {
             try {
-              const presignedUrl = await getSignedDownloadUrl(file.r2_key);
-              const mediaType = file.mime_type.startsWith('image') ? 'image' 
-                              : file.mime_type.startsWith('video') ? 'video' 
-                              : 'document';
-              await sendMediaMessage(sender, mediaType, presignedUrl, file.filename);
+              await sendFileToUser(sender, file);
             } catch (err) {
-              console.error(`Error sending matching file ${file.filename}:`, err);
+              console.error(`Error sending DB file ${file.filename}:`, err);
+            }
+          }
+
+          // Send Google Drive files directly (no downloading/uploading)
+          for (const file of uniqueDriveFiles) {
+            try {
+              await sendGDriveFileToUser(sender, file);
+            } catch (err) {
+              console.error(`Error sending Google Drive file ${file.name}:`, err);
             }
           }
           return new NextResponse('OK', { status: 200 });
         }
-      }
-      
-      // 2c. Direct command matching for retrieval (case-insensitive fallback)
-      const retrieveMatch = text.match(/^(?:retrieve|get|download)\s+(.+)$/i);
-      if (retrieveMatch) {
-        const query = retrieveMatch[1].trim();
-        await sendTextMessage(sender, `Looking up file matching: "${query}"...`);
-        const file = await getFileByIdOrNameOrMessageId(query);
-        if (file) {
-          try {
-            const presignedUrl = await getSignedDownloadUrl(file.r2_key);
-            const mediaType = file.mime_type.startsWith('image') ? 'image' 
-                            : file.mime_type.startsWith('video') ? 'video' 
-                            : 'document';
-                            
-            await sendTextMessage(sender, `Here is the requested file: ${file.filename}`);
-            await sendMediaMessage(sender, mediaType, presignedUrl, file.filename);
-          } catch (err) {
-            console.error("Error generating URL or sending media:", err);
-            await sendTextMessage(sender, "Sorry, I found the file but failed to retrieve it from storage.");
-          }
-        } else {
-          await sendTextMessage(sender, `Sorry, I couldn't find any file matching "${query}".`);
-        }
+        
+        await sendTextMessage(sender, `No files found for course code "${courseKeywords[0]}". Files may not have been uploaded yet.`);
         return new NextResponse('OK', { status: 200 });
       }
-      
-      // 2d. Pass to AI for intent resolution
+
+      // ── Step 2c: Short direct input (filename, file ID, message ID) ──
+      const wordCount = text.split(/\s+/).length;
+      if (wordCount <= 4) {
+        // 1. Try Supabase
+        const dbFile = await getFileByIdOrNameOrMessageId(text);
+        if (dbFile) {
+          try {
+            await sendTextMessage(sender, `Found matching file: ${dbFile.filename}`);
+            await sendFileToUser(sender, dbFile);
+            return new NextResponse('OK', { status: 200 });
+          } catch (err) {
+            console.error(`Error sending direct DB file:`, err);
+          }
+        }
+
+        // 2. Try Google Drive
+        const driveFiles = await searchGDriveFiles(text);
+        if (driveFiles.length > 0) {
+          const driveFile = driveFiles[0];
+          try {
+            await sendTextMessage(sender, `Found matching Google Drive file: ${driveFile.name}`);
+            await sendGDriveFileToUser(sender, driveFile);
+            return new NextResponse('OK', { status: 200 });
+          } catch (err) {
+            console.error(`Error sending direct Drive file:`, err);
+          }
+        }
+      }
+
+      // ── Step 2d: AI intent resolution (conversational messages, complex requests) ──
       let intent;
       try {
         intent = await processUserIntent(text, isSenderAdmin);
       } catch (aiErr) {
-        console.error("AI processing error, falling back to simple chat response:", aiErr);
+        console.error("AI processing error:", aiErr);
         intent = {
           type: 'chat',
-          reply: "I'm here to help, but I'm currently experiencing some technical difficulties with my AI brain. You can upload files, retrieve them using 'retrieve <filename>', or ask for files by sending their name/course code!"
+          reply: "I'm here to help! You can:\n• Upload files by sending them directly\n• Retrieve files by name or course code (e.g. \"eng201\")\n• Use \"retrieve <filename>\" for specific files"
         };
       }
       
@@ -193,17 +259,27 @@ export async function POST(request: Request) {
 
         case 'send_file':
           if (intent.filename) {
-            const file = await getFileByIdOrNameOrMessageId(intent.filename);
-            if (file) {
-              const presignedUrl = await getSignedDownloadUrl(file.r2_key);
-              const mediaType = file.mime_type.startsWith('image') ? 'image' 
-                              : file.mime_type.startsWith('video') ? 'video' 
-                              : 'document';
-                              
-              await sendTextMessage(sender, intent.reply || "Here is the file you requested.");
-              await sendMediaMessage(sender, mediaType, presignedUrl, file.filename);
-            } else {
-              await sendTextMessage(sender, `Sorry, I couldn't find a file named ${intent.filename}.`);
+            try {
+              // 1. Try Supabase first
+              const dbFile = await getFileByIdOrNameOrMessageId(intent.filename);
+              if (dbFile) {
+                await sendTextMessage(sender, intent.reply || "Here is the file you requested.");
+                await sendFileToUser(sender, dbFile);
+                break;
+              }
+
+              // 2. Try Google Drive (directly query and send download url)
+              const driveFiles = await searchGDriveFiles(intent.filename);
+              if (driveFiles.length > 0) {
+                const driveFile = driveFiles[0];
+                await sendTextMessage(sender, intent.reply || "Here is the file you requested.");
+                await sendGDriveFileToUser(sender, driveFile);
+              } else {
+                await sendTextMessage(sender, `Sorry, I couldn't find a file named "${intent.filename}".`);
+              }
+            } catch (err) {
+              console.error("Error in AI send_file intent:", err);
+              await sendTextMessage(sender, "Sorry, I found the file but failed to send it. Please try again.");
             }
           }
           break;
@@ -219,6 +295,7 @@ export async function POST(request: Request) {
 
   } catch (error) {
     console.error('Webhook Error:', error);
-    return new NextResponse('Internal Server Error', { status: 500 });
+    // CRITICAL: Always return 200 to WhatsApp to prevent infinite retries.
+    return new NextResponse('OK', { status: 200 });
   }
 }

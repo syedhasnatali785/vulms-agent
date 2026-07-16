@@ -3,13 +3,13 @@ import { getAvailableFiles } from './supabase';
 
 const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID!;
 const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN!;
-const AI_MODEL = '@cf/meta/llama-3.1-8b-instruct';
+const AI_MODEL = '@cf/meta/llama-3.1-8b-instruct-awq';
 
 /**
  * We use Cloudflare Workers AI via REST API because Vercel Serverless
  * does not support the native Cloudflare Workers bindings.
  */
-export async function runCloudflareAI(messages: any[]) {
+export async function runCloudflareAI(messages: any[]): Promise<string> {
   const url = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${AI_MODEL}`;
   
   try {
@@ -21,12 +21,23 @@ export async function runCloudflareAI(messages: any[]) {
           Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
           'Content-Type': 'application/json',
         },
+        timeout: 8000, // 8s timeout to stay within Vercel's 10s limit
       }
     );
-    return response.data.result.response;
+
+    // Cloudflare can return 200 with { success: false, result: {}, errors: [...] }
+    const data = response.data;
+    if (!data?.success || !data?.result?.response) {
+      console.error('Cloudflare AI returned unsuccessful response:', JSON.stringify(data));
+      throw new Error(`Cloudflare AI error: success=${data?.success}, errors=${JSON.stringify(data?.errors || [])}`);
+    }
+
+    return data.result.response;
   } catch (error: any) {
-    console.error('Error running Cloudflare AI:', error.response?.data || error.message);
-    throw error;
+    const status = error.response?.status;
+    const errData = error.response?.data;
+    console.error(`Cloudflare AI error (status=${status}):`, errData || error.message);
+    throw new Error(`Cloudflare AI failed: status=${status}, message=${error.message}`);
   }
 }
 
@@ -43,7 +54,7 @@ export async function processUserIntent(userMessage: string, isAdmin: boolean) {
   const files = await getAvailableFiles();
   const fileNames = files.map((f: any) => `${f.filename} (ID: ${f.id})`).join(', ');
 
-  let systemPrompt = `You are a helpful WhatsApp AI agent. 
+  const systemPrompt = `You are a helpful WhatsApp AI agent. 
 You can send users documents/videos/images that have been uploaded to Cloudflare R2.
 Available files right now: ${fileNames ? fileNames : 'None'}.
 
@@ -69,14 +80,18 @@ Output ONLY valid JSON. No markdown formatting blocks around it.`;
   const aiResponse = await runCloudflareAI(messages);
   
   try {
-    // Attempt to parse JSON response. Cloudflare's Llama-3-8b-instruct might wrap it in markdown.
+    // Attempt to parse JSON response. The model might wrap it in markdown.
     let cleanResponse = aiResponse.trim();
     if (cleanResponse.startsWith('```json')) {
-      cleanResponse = cleanResponse.replace(/^```json\n/, '').replace(/\n```$/, '');
+      cleanResponse = cleanResponse.replace(/^```json\n?/, '').replace(/\n?```$/, '');
+    }
+    if (cleanResponse.startsWith('```')) {
+      cleanResponse = cleanResponse.replace(/^```\n?/, '').replace(/\n?```$/, '');
     }
     return JSON.parse(cleanResponse);
   } catch (e) {
     console.error("Failed to parse AI JSON response:", aiResponse);
-    return { type: 'chat', reply: "I didn't quite catch that. Can you rephrase?" };
+    // Return the raw text as a chat reply so the user still gets a response
+    return { type: 'chat', reply: aiResponse || "I didn't quite catch that. Can you rephrase?" };
   }
 }
