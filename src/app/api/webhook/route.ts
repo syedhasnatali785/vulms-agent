@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { isAdmin, addAdmin, saveFileMetadata, getFileByName } from '@/lib/supabase';
+import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractCourseKeywords, getFilesByKeywords } from '@/lib/supabase';
 import { downloadWhatsAppMedia, sendTextMessage, sendMediaMessage } from '@/lib/whatsapp';
 import { uploadFileToR2, getSignedDownloadUrl } from '@/lib/r2';
 import { processUserIntent } from '@/lib/ai';
@@ -47,28 +47,50 @@ export async function POST(request: Request) {
 
     // 1. Handle File Uploads (Media)
     if (message.type === 'image' || message.type === 'video' || message.type === 'document') {
-      if (!isSenderAdmin) {
-        await sendTextMessage(sender, "Sorry, only administrators can upload files to the AI agent.");
-        return new NextResponse('OK', { status: 200 });
-      }
-
       const mediaId = message[message.type].id;
       const caption = message[message.type].caption || '';
+      const messageId = message.id; // WhatsApp Message ID
       
       try {
         await sendTextMessage(sender, "Downloading and saving your file...");
         const { buffer, mimeType } = await downloadWhatsAppMedia(mediaId);
         
-        // Generate a filename or use caption
+        // Generate a filename or use original filename/caption
+        let rawFilename = '';
+        if (message.type === 'document' && message.document?.filename) {
+          rawFilename = message.document.filename;
+        } else {
+          rawFilename = caption || `file_${Date.now()}`;
+        }
+        
         const ext = mimeType.split('/')[1] || 'bin';
-        const rawFilename = caption || `file_${Date.now()}`;
-        const filename = `${rawFilename.replace(/\\s+/g, '_')}.${ext}`;
+        const safeExt = ext.split(';')[0] || 'bin';
+        
+        // Ensure the filename has the correct extension if not already present
+        let filename = rawFilename.replace(/\s+/g, '_');
+        if (!filename.toLowerCase().endsWith(`.${safeExt.toLowerCase()}`)) {
+          if (mimeType === 'application/pdf' && !filename.toLowerCase().endsWith('.pdf')) {
+            filename = `${filename}.pdf`;
+          } else {
+            filename = `${filename}.${safeExt}`;
+          }
+        }
+        
         const r2Key = `uploads/${Date.now()}_${filename}`;
         
         await uploadFileToR2(r2Key, buffer, mimeType);
-        await saveFileMetadata(rawFilename, r2Key, mimeType, sender);
+        const savedFile = await saveFileMetadata(filename, r2Key, mimeType, sender, messageId);
         
-        await sendTextMessage(sender, `File successfully saved as: ${rawFilename}`);
+        let successMessage = `File successfully saved!\n\n` +
+          `📂 Filename: ${filename}\n`;
+        
+        if (savedFile) {
+          successMessage += `🆔 File ID: ${savedFile.id}\n`;
+        }
+        successMessage += `✉️ Message ID: ${messageId}\n\n` +
+          `You can retrieve this file anytime by typing "retrieve ${savedFile?.id || filename}" or "retrieve ${messageId}".`;
+        
+        await sendTextMessage(sender, successMessage);
       } catch (e: any) {
         console.error("Upload Error:", e);
         await sendTextMessage(sender, "Failed to process the upload. Make sure the file is supported.");
@@ -76,9 +98,55 @@ export async function POST(request: Request) {
       return new NextResponse('OK', { status: 200 });
     }
 
-    // 2. Handle Text Messages via AI
+    // 2. Handle Text Messages
     if (message.type === 'text') {
-      const text = message.text.body;
+      const text = message.text.body.trim();
+
+      // 2a. Automatic Keyword/Course-Code Matching
+      const keywords = extractCourseKeywords(text);
+      if (keywords.length > 0) {
+        const matchingFiles = await getFilesByKeywords(keywords);
+        if (matchingFiles.length > 0) {
+          await sendTextMessage(sender, `Automatically found ${matchingFiles.length} file(s) matching your course codes:`);
+          for (const file of matchingFiles) {
+            try {
+              const presignedUrl = await getSignedDownloadUrl(file.r2_key);
+              const mediaType = file.mime_type.startsWith('image') ? 'image' 
+                              : file.mime_type.startsWith('video') ? 'video' 
+                              : 'document';
+              await sendMediaMessage(sender, mediaType, presignedUrl, file.filename);
+            } catch (err) {
+              console.error(`Error sending matching file ${file.filename}:`, err);
+            }
+          }
+          return new NextResponse('OK', { status: 200 });
+        }
+      }
+      
+      // Direct command matching for retrieval (case-insensitive)
+      const retrieveMatch = text.match(/^(?:retrieve|get|download)\s+(.+)$/i);
+      if (retrieveMatch) {
+        const query = retrieveMatch[1].trim();
+        await sendTextMessage(sender, `Looking up file matching: "${query}"...`);
+        const file = await getFileByIdOrNameOrMessageId(query);
+        if (file) {
+          try {
+            const presignedUrl = await getSignedDownloadUrl(file.r2_key);
+            const mediaType = file.mime_type.startsWith('image') ? 'image' 
+                            : file.mime_type.startsWith('video') ? 'video' 
+                            : 'document';
+                            
+            await sendTextMessage(sender, `Here is the requested file: ${file.filename}`);
+            await sendMediaMessage(sender, mediaType, presignedUrl, file.filename);
+          } catch (err) {
+            console.error("Error generating URL or sending media:", err);
+            await sendTextMessage(sender, "Sorry, I found the file but failed to retrieve it from storage.");
+          }
+        } else {
+          await sendTextMessage(sender, `Sorry, I couldn't find any file matching "${query}".`);
+        }
+        return new NextResponse('OK', { status: 200 });
+      }
       
       const intent = await processUserIntent(text, isSenderAdmin);
       
@@ -95,7 +163,7 @@ export async function POST(request: Request) {
 
         case 'send_file':
           if (intent.filename) {
-            const file = await getFileByName(intent.filename);
+            const file = await getFileByIdOrNameOrMessageId(intent.filename);
             if (file) {
               const presignedUrl = await getSignedDownloadUrl(file.r2_key);
               const mediaType = file.mime_type.startsWith('image') ? 'image' 

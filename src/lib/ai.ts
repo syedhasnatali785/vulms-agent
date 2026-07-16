@@ -41,16 +41,16 @@ export async function runCloudflareAI(messages: any[]) {
  */
 export async function processUserIntent(userMessage: string, isAdmin: boolean) {
   const files = await getAvailableFiles();
-  const fileNames = files.map((f: any) => f.filename).join(', ');
+  const fileNames = files.map((f: any) => `${f.filename} (ID: ${f.id})`).join(', ');
 
   let systemPrompt = `You are a helpful WhatsApp AI agent. 
-You can send users documents/videos/images that have been uploaded by admins.
+You can send users documents/videos/images that have been uploaded to Cloudflare R2.
 Available files right now: ${fileNames ? fileNames : 'None'}.
 
 The user's role is: ${isAdmin ? 'ADMIN' : 'STANDARD USER'}.
 
-If the user asks for a file that is in the list, format your response exactly as JSON:
-{ "type": "send_file", "filename": "<exact_filename>", "reply": "<short message to accompany the file>" }
+If the user asks for a file (either by its filename, its database ID, or its message ID), format your response exactly as JSON:
+{ "type": "send_file", "filename": "<exact_filename_or_id_or_message_id_requested>", "reply": "<short message to accompany the file>" }
 
 If an ADMIN user asks to add a new admin (e.g., "add admin 1234567890"), format exactly as JSON:
 { "type": "add_admin", "newNumber": "<the_number_to_add>", "reply": "<confirmation message>" }
