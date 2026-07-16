@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractCourseKeywords, getFilesByKeywords } from '@/lib/supabase';
+import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractKeywords, getFilesByKeywords } from '@/lib/supabase';
 import { downloadWhatsAppMedia, sendTextMessage, sendMediaMessage } from '@/lib/whatsapp';
 import { uploadFileToR2, getSignedDownloadUrl } from '@/lib/r2';
 import { processUserIntent } from '@/lib/ai';
@@ -102,12 +102,32 @@ export async function POST(request: Request) {
     if (message.type === 'text') {
       const text = message.text.body.trim();
 
-      // 2a. Automatic Keyword/Course-Code Matching
-      const keywords = extractCourseKeywords(text);
+      // 2a. Direct file lookup (non-conversational messages)
+      // Check if the text itself matches a file ID, message ID, or filename directly
+      const isConversational = /^(hi|hello|hey|yes|no|ok|okay|help|admin|who|what|why|how|please|thank|thanks)\b/i.test(text);
+      if (!isConversational) {
+        const directFile = await getFileByIdOrNameOrMessageId(text);
+        if (directFile) {
+          try {
+            const presignedUrl = await getSignedDownloadUrl(directFile.r2_key);
+            const mediaType = directFile.mime_type.startsWith('image') ? 'image' 
+                            : directFile.mime_type.startsWith('video') ? 'video' 
+                            : 'document';
+            await sendTextMessage(sender, `Found matching file: ${directFile.filename}`);
+            await sendMediaMessage(sender, mediaType, presignedUrl, directFile.filename);
+            return new NextResponse('OK', { status: 200 });
+          } catch (err) {
+            console.error(`Error sending direct file ${directFile.filename}:`, err);
+          }
+        }
+      }
+
+      // 2b. Automatic Keyword/Similarity Matching from Sentences
+      const keywords = extractKeywords(text);
       if (keywords.length > 0) {
         const matchingFiles = await getFilesByKeywords(keywords);
         if (matchingFiles.length > 0) {
-          await sendTextMessage(sender, `Automatically found ${matchingFiles.length} file(s) matching your course codes:`);
+          await sendTextMessage(sender, `Automatically found ${matchingFiles.length} file(s) matching your request:`);
           for (const file of matchingFiles) {
             try {
               const presignedUrl = await getSignedDownloadUrl(file.r2_key);
@@ -123,7 +143,7 @@ export async function POST(request: Request) {
         }
       }
       
-      // Direct command matching for retrieval (case-insensitive)
+      // 2c. Direct command matching for retrieval (case-insensitive fallback)
       const retrieveMatch = text.match(/^(?:retrieve|get|download)\s+(.+)$/i);
       if (retrieveMatch) {
         const query = retrieveMatch[1].trim();
@@ -148,7 +168,17 @@ export async function POST(request: Request) {
         return new NextResponse('OK', { status: 200 });
       }
       
-      const intent = await processUserIntent(text, isSenderAdmin);
+      // 2d. Pass to AI for intent resolution
+      let intent;
+      try {
+        intent = await processUserIntent(text, isSenderAdmin);
+      } catch (aiErr) {
+        console.error("AI processing error, falling back to simple chat response:", aiErr);
+        intent = {
+          type: 'chat',
+          reply: "I'm here to help, but I'm currently experiencing some technical difficulties with my AI brain. You can upload files, retrieve them using 'retrieve <filename>', or ask for files by sending their name/course code!"
+        };
+      }
       
       switch (intent.type) {
         case 'add_admin':

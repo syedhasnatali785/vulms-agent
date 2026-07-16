@@ -44,31 +44,65 @@ export async function saveFileMetadata(filename: string, r2Key: string, mimeType
     insertData.message_id = messageId;
   }
 
-  const { data, error } = await supabase
-    .from('files')
-    .insert([insertData])
-    .select();
-
-  if (error) {
-    // If it failed because message_id column doesn't exist (code 42703 or message indicates it)
-    if (error.code === '42703' || error.message?.includes('column "message_id"')) {
-      console.warn('message_id column does not exist in files table, falling back...');
-      const { data: fallbackData, error: fallbackError } = await supabase
-        .from('files')
-        .insert([{ filename, r2_key: r2Key, mime_type: mimeType, uploaded_by: uploadedBy }])
-        .select();
-
-      if (fallbackError) {
-        console.error('Error saving file metadata (fallback):', fallbackError);
-        return null;
-      }
-      return fallbackData[0];
+  // Helper function to handle unique constraint violations by updating existing files
+  const handleUniqueViolation = async (dataToSave: any) => {
+    console.warn('Unique constraint violation, updating existing record...');
+    const { data: updateData, error: updateError } = await supabase
+      .from('files')
+      .update(dataToSave)
+      .eq('filename', filename)
+      .select();
+      
+    if (!updateError && updateData && updateData.length > 0) {
+      return updateData[0];
     }
-
-    console.error('Error saving file metadata:', error);
+    console.error('Error updating existing record on unique violation:', updateError);
     return null;
+  };
+
+  // Try 1: Insert all fields
+  let res = await supabase.from('files').insert([insertData]).select();
+  if (!res.error && res.data && res.data.length > 0) {
+    return res.data[0];
   }
-  return data[0];
+  
+  if (res.error) {
+    console.warn('Initial insert failed, error details:', res.error);
+    if (res.error.code === '23505') {
+      return await handleUniqueViolation(insertData);
+    }
+  }
+
+  // Try 2: Drop message_id (in case message_id is missing or causing error)
+  const insertData2: any = { filename, r2_key: r2Key, mime_type: mimeType, uploaded_by: uploadedBy };
+  res = await supabase.from('files').insert([insertData2]).select();
+  if (!res.error && res.data && res.data.length > 0) {
+    return res.data[0];
+  }
+
+  if (res.error) {
+    console.warn('Second insert failed, error details:', res.error);
+    if (res.error.code === '23505') {
+      return await handleUniqueViolation(insertData2);
+    }
+  }
+
+  // Try 3: Drop uploaded_by (in case uploaded_by is missing or has foreign key constraint issues)
+  const insertData3: any = { filename, r2_key: r2Key, mime_type: mimeType };
+  res = await supabase.from('files').insert([insertData3]).select();
+  if (!res.error && res.data && res.data.length > 0) {
+    return res.data[0];
+  }
+
+  if (res.error) {
+    console.error('Third insert failed, error details:', res.error);
+    if (res.error.code === '23505') {
+      return await handleUniqueViolation(insertData3);
+    }
+  }
+
+  console.error('All metadata insertion attempts failed.');
+  return null;
 }
 
 export async function getAvailableFiles() {
@@ -103,8 +137,8 @@ export async function getFileByIdOrNameOrMessageId(query: string) {
       .from('files')
       .select('id, filename, r2_key, mime_type')
       .eq('id', idNum)
-      .single();
-    if (data && !error) return data;
+      .limit(1);
+    if (data && data.length > 0 && !error) return data[0];
   }
 
   // 2. Try querying by message_id
@@ -113,8 +147,8 @@ export async function getFileByIdOrNameOrMessageId(query: string) {
       .from('files')
       .select('id, filename, r2_key, mime_type')
       .eq('message_id', trimmed)
-      .single();
-    if (data && !error) return data;
+      .limit(1);
+    if (data && data.length > 0 && !error) return data[0];
   } catch (e) {
     // message_id column might not exist in table, ignore error
   }
@@ -124,25 +158,56 @@ export async function getFileByIdOrNameOrMessageId(query: string) {
     .from('files')
     .select('id, filename, r2_key, mime_type')
     .ilike('filename', `%${trimmed}%`)
-    .limit(1)
-    .single();
+    .limit(1);
 
-  if (error) return null;
-  return data;
+  if (error || !data || data.length === 0) return null;
+  return data[0];
 }
 
-export function extractCourseKeywords(text: string): string[] {
-  const pattern = /\b([a-zA-Z]{2,4})\s*-?\s*(\d{3})\b/gi;
+export function extractKeywords(text: string): string[] {
   const keywords = new Set<string>();
+  
+  // 1. Extract course codes (e.g., CS101, ENG 201, MTH-301, etc.)
+  const coursePattern = /\b([a-zA-Z]{2,4})\s*[-_]?\s*(\d{3})\b/gi;
   let match;
-  while ((match = pattern.exec(text)) !== null) {
+  while ((match = coursePattern.exec(text)) !== null) {
     const prefix = match[1].toLowerCase();
     const num = match[2];
     keywords.add(`${prefix}${num}`);
     keywords.add(`${prefix} ${num}`);
     keywords.add(`${prefix}-${num}`);
+    keywords.add(`${prefix}_${num}`);
   }
+
+  // 2. Extract other significant words (length >= 3, not common stop words)
+  const stopWords = new Set([
+    'the', 'and', 'for', 'you', 'get', 'please', 'send', 'file', 'retrieve', 
+    'download', 'with', 'from', 'this', 'that', 'here', 'your', 'find', 'show', 
+    'give', 'need', 'want', 'search', 'look', 'matching', 'handout', 'handouts'
+  ]);
+  
+  const words = text.split(/[^a-zA-Z0-9_-]+/);
+  for (const w of words) {
+    const cleanWord = w.toLowerCase().trim();
+    if (cleanWord.length >= 3 && !stopWords.has(cleanWord) && !/^\d+$/.test(cleanWord)) {
+      keywords.add(cleanWord);
+      if (cleanWord.includes('_') || cleanWord.includes('-')) {
+        const parts = cleanWord.split(/[_-]+/);
+        for (const p of parts) {
+          if (p.length >= 3 && !stopWords.has(p)) {
+            keywords.add(p);
+          }
+        }
+      }
+    }
+  }
+
   return Array.from(keywords);
+}
+
+// Keep extractCourseKeywords for compatibility
+export function extractCourseKeywords(text: string): string[] {
+  return extractKeywords(text);
 }
 
 export async function getFilesByKeywords(keywords: string[]) {
