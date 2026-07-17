@@ -16,6 +16,7 @@ export default function Home() {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(true);
   const [pollingActive, setPollingActive] = useState<boolean>(true);
+  const [stats, setStats] = useState<any>(null);
 
   // Fetch messages from API
   const fetchMessages = async () => {
@@ -32,16 +33,31 @@ export default function Home() {
     }
   };
 
+  // Fetch server stats
+  const fetchStats = async () => {
+    try {
+      const response = await fetch('/api/stats');
+      if (response.ok) {
+        const data = await response.json();
+        setStats(data);
+      }
+    } catch (error) {
+      console.error('Error fetching stats:', error);
+    }
+  };
+
   // Initial fetch
   useEffect(() => {
     fetchMessages();
+    fetchStats();
   }, []);
 
-  // Poll for new messages every 5 seconds if active
+  // Poll for updates every 5 seconds if active
   useEffect(() => {
     if (!pollingActive) return;
     const interval = setInterval(() => {
       fetchMessages();
+      fetchStats();
     }, 5000);
     return () => clearInterval(interval);
   }, [pollingActive]);
@@ -67,9 +83,28 @@ export default function Home() {
     }
   };
 
+  // Helper to format memory GB
+  const formatGB = (bytes: number) => {
+    if (!bytes) return '0 GB';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+  };
+
+  // Helper to format uptime
+  const formatUptime = (seconds: number) => {
+    if (!seconds) return '0m';
+    const d = Math.floor(seconds / (3600 * 24));
+    const h = Math.floor((seconds % (3600 * 24)) / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const parts = [];
+    if (d > 0) parts.push(`${d}d`);
+    if (h > 0) parts.push(`${h}h`);
+    if (m > 0) parts.push(`${m}m`);
+    return parts.join(' ') || '0m';
+  };
+
   return (
     <div className="flex h-screen w-screen bg-zinc-950 font-sans text-zinc-100 overflow-hidden">
-      {/* Sidebar - Chat Participants */}
+      {/* Sidebar - Chat Participants & Health Stats */}
       <aside className="w-80 border-r border-zinc-800 bg-zinc-900/50 flex flex-col h-full">
         {/* Sidebar Header */}
         <div className="p-4 border-b border-zinc-800 flex items-center justify-between">
@@ -81,7 +116,7 @@ export default function Home() {
             <h1 className="font-semibold text-lg tracking-tight">LMS Inbox Channel</h1>
           </div>
           <button 
-            onClick={fetchMessages} 
+            onClick={() => { fetchMessages(); fetchStats(); }} 
             title="Refresh feed"
             className="p-1.5 hover:bg-zinc-800 rounded-lg text-zinc-400 hover:text-zinc-100 transition-colors"
           >
@@ -156,6 +191,74 @@ export default function Home() {
           )}
         </div>
 
+        {/* Server Health Statistics Section */}
+        <div className="p-4 border-t border-zinc-800 bg-zinc-950/20">
+          <div className="text-xs font-semibold tracking-wider text-zinc-500 uppercase mb-3">
+            Server Health Stats
+          </div>
+          {stats ? (
+            <div className="space-y-3 text-xs">
+              {/* CPU Usage */}
+              <div>
+                <div className="flex justify-between text-zinc-400 mb-1">
+                  <span>CPU Usage</span>
+                  <span className="font-semibold text-zinc-200">{stats.cpuUsage}%</span>
+                </div>
+                <div className="w-full bg-zinc-850 h-1.5 rounded-full overflow-hidden">
+                  <div 
+                    className={`h-full rounded-full transition-all duration-500 ${
+                      stats.cpuUsage > 80 ? 'bg-rose-500' : stats.cpuUsage > 50 ? 'bg-amber-500' : 'bg-blue-500'
+                    }`}
+                    style={{ width: `${stats.cpuUsage}%` }}
+                  />
+                </div>
+              </div>
+
+              {/* Memory Usage */}
+              <div>
+                <div className="flex justify-between text-zinc-400 mb-1">
+                  <span>Memory ({formatGB(stats.totalMem - stats.freeMem)} / {formatGB(stats.totalMem)})</span>
+                  <span className="font-semibold text-zinc-200">{stats.memUsage}%</span>
+                </div>
+                <div className="w-full bg-zinc-850 h-1.5 rounded-full overflow-hidden">
+                  <div 
+                    className={`h-full rounded-full transition-all duration-500 ${
+                      stats.memUsage > 85 ? 'bg-rose-500' : stats.memUsage > 60 ? 'bg-amber-500' : 'bg-emerald-500'
+                    }`}
+                    style={{ width: `${stats.memUsage}%` }}
+                  />
+                </div>
+              </div>
+
+              {/* Load Average */}
+              {stats.loadAvg && stats.loadAvg.length > 0 && (
+                <div className="flex justify-between items-center text-zinc-400 border-t border-zinc-800/40 pt-2">
+                  <span>Load Avg (1/5/15m)</span>
+                  <span className="text-zinc-200 font-mono">
+                    {stats.loadAvg[0]?.toFixed(2)} {stats.loadAvg[1]?.toFixed(2)} {stats.loadAvg[2]?.toFixed(2)}
+                  </span>
+                </div>
+              )}
+
+              {/* Server Uptime */}
+              <div className="flex justify-between items-center text-zinc-400">
+                <span>Server Uptime</span>
+                <span className="text-zinc-200 font-medium">{formatUptime(stats.uptime)}</span>
+              </div>
+
+              {/* Server Host Platform */}
+              <div className="flex justify-between items-center text-zinc-400">
+                <span>OS / Platform</span>
+                <span className="text-zinc-300 capitalize truncate max-w-[120px]" title={`${stats.platform} (${stats.arch})`}>
+                  {stats.platform} ({stats.arch})
+                </span>
+              </div>
+            </div>
+          ) : (
+            <div className="text-zinc-600 text-xs text-center py-2">Loading system telemetry...</div>
+          )}
+        </div>
+
         {/* Polling Indicator Footer */}
         <div className="p-3 border-t border-zinc-800 bg-zinc-950/80 flex items-center justify-between text-xs text-zinc-400">
           <span>Live Auto-Refresh</span>
@@ -214,7 +317,7 @@ export default function Home() {
               <p className="text-xs">Incoming and outgoing text messages will appear here in real-time as users interact with the bot.</p>
             </div>
           ) : (
-            filteredMessages.map((msg) => {
+            [...filteredMessages].reverse().map((msg) => {
               const isIncoming = msg.direction === 'incoming';
               
               return (

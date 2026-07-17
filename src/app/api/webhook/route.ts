@@ -188,57 +188,71 @@ export async function POST(request: Request) {
       const sender = message.from;
       const isSenderAdmin = await isAdmin(sender);
 
+      // Supported WhatsApp media types
+      const SUPPORTED_MEDIA_TYPES = ['image', 'video', 'document', 'audio', 'voice', 'sticker'];
+
       // 1. Handle File Uploads (Media)
-      if (message.type === 'image' || message.type === 'video' || message.type === 'document') {
-        const mediaId = message[message.type].id;
-        const caption = message[message.type].caption || '';
+      if (SUPPORTED_MEDIA_TYPES.includes(message.type)) {
+        const mediaId = message[message.type]?.id;
+        const caption = message[message.type]?.caption || '';
         
-        try {
-          await sendAndLogTextMessage(sender, "Downloading and saving your file...");
-          const { buffer, mimeType } = await downloadWhatsAppMedia(mediaId);
-          
-          // Generate a filename or use original filename/caption
-          let rawFilename = '';
-          if (message.type === 'document' && message.document?.filename) {
-            rawFilename = message.document.filename;
-          } else {
-            rawFilename = caption || `file_${Date.now()}`;
-          }
-          
-          const ext = mimeType.split('/')[1] || 'bin';
-          const safeExt = ext.split(';')[0] || 'bin';
-          
-          // Ensure the filename has the correct extension if not already present
-          let filename = rawFilename.replace(/\s+/g, '_');
-          if (!filename.toLowerCase().endsWith(`.${safeExt.toLowerCase()}`)) {
-            if (mimeType === 'application/pdf' && !filename.toLowerCase().endsWith('.pdf')) {
-              filename = `${filename}.pdf`;
+        if (mediaId) {
+          try {
+            await sendAndLogTextMessage(sender, `Downloading and saving your ${message.type}...`);
+            const { buffer, mimeType } = await downloadWhatsAppMedia(mediaId);
+            
+            // Generate a filename or use original filename/caption
+            let rawFilename = '';
+            if (message.type === 'document' && message.document?.filename) {
+              rawFilename = message.document.filename;
             } else {
-              filename = `${filename}.${safeExt}`;
+              rawFilename = caption || `file_${Date.now()}`;
             }
+            
+            const ext = mimeType.split('/')[1] || 'bin';
+            const safeExt = ext.split(';')[0] || 'bin';
+            
+            // Ensure the filename has the correct extension if not already present
+            let filename = rawFilename.replace(/\s+/g, '_');
+            if (!filename.toLowerCase().endsWith(`.${safeExt.toLowerCase()}`)) {
+              if (mimeType === 'application/pdf' && !filename.toLowerCase().endsWith('.pdf')) {
+                filename = `${filename}.pdf`;
+              } else {
+                filename = `${filename}.${safeExt}`;
+              }
+            }
+            
+            // Store directly as uploads/filename in R2 so the key matches the filename
+            const r2Key = `uploads/${filename}`;
+            
+            await uploadFileToR2(r2Key, buffer, mimeType);
+            const savedFile = await saveFileMetadata(filename, r2Key, mimeType, sender);
+            
+            let successMessage = `File successfully saved!\n\n` +
+              `📂 Filename: ${filename}\n`;
+            
+            if (savedFile) {
+              successMessage += `🆔 File ID: ${savedFile.id}\n`;
+            }
+            successMessage += `✉️ Message ID: ${messageId}\n\n` +
+              `You can retrieve this file anytime by typing its name or course code (e.g. "eng201").`;
+            
+            await sendAndLogTextMessage(sender, successMessage);
+          } catch (e: any) {
+            console.error("Upload Error:", e);
+            await sendAndLogTextMessage(sender, "Failed to process the upload. Make sure the file is supported.");
           }
-          
-          // Store directly as uploads/filename in R2 so the key matches the filename
-          const r2Key = `uploads/${filename}`;
-          
-          await uploadFileToR2(r2Key, buffer, mimeType);
-          const savedFile = await saveFileMetadata(filename, r2Key, mimeType, sender);
-          
-          let successMessage = `File successfully saved!\n\n` +
-            `📂 Filename: ${filename}\n`;
-          
-          if (savedFile) {
-            successMessage += `🆔 File ID: ${savedFile.id}\n`;
-          }
-          successMessage += `✉️ Message ID: ${messageId}\n\n` +
-            `You can retrieve this file anytime by typing its name or course code (e.g. "eng201").`;
-          
-          await sendAndLogTextMessage(sender, successMessage);
-        } catch (e: any) {
-          console.error("Upload Error:", e);
-          await sendAndLogTextMessage(sender, "Failed to process the upload. Make sure the file is supported.");
         }
-        return;
+        
+        // If there is no caption accompanied, we stop here.
+        // Otherwise, we overwrite the message type to 'text' and body to caption 
+        // to let the AI process it.
+        if (!caption.trim()) {
+          return;
+        }
+        
+        message.type = 'text';
+        message.text = { body: caption.trim() };
       }
 
       // 2. Handle Text Messages
