@@ -129,6 +129,10 @@ async function sendAndLogTextMessage(to: string, text: string) {
 }
 
 async function sendFileToUser(sender: string, file: any) {
+  if (file.filename.toLowerCase().includes('midterm')) {
+    addLog('warn', `Blocked sending file "${file.filename}" because it contains "midterm"`);
+    return;
+  }
   const fileUrl = await getFileUrl(file.r2_key);
   const mediaType = file.mime_type.startsWith('image') ? 'image'
                    : file.mime_type.startsWith('video') ? 'video'
@@ -138,6 +142,10 @@ async function sendFileToUser(sender: string, file: any) {
 }
 
 async function sendGDriveFileToUser(sender: string, file: any) {
+  if (file.name.toLowerCase().includes('midterm')) {
+    addLog('warn', `Blocked sending GDrive file "${file.name}" because it contains "midterm"`);
+    return;
+  }
   const fileUrl = `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media&key=${process.env.GOOGLE_API_KEY}`;
   const mediaType = file.mimeType.startsWith('image') ? 'image'
                    : file.mimeType.startsWith('video') ? 'video'
@@ -250,6 +258,7 @@ export async function POST(request: Request) {
             try {
               // Search Supabase
               let dbFiles = await getFilesByKeywords([courseCode], contextTerms);
+              dbFiles = dbFiles.filter(f => !f.filename.toLowerCase().includes('midterm'));
               // Apply exclusion filter: remove files whose name contains any excluded term
               if (excludeTerms.length > 0) {
                 const before = dbFiles.length;
@@ -260,6 +269,7 @@ export async function POST(request: Request) {
 
               // Search Google Drive
               let driveFiles = await searchGDriveFiles(courseCode, contextTerms);
+              driveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
               // Apply exclusion filter: remove files whose name contains any excluded term
               if (excludeTerms.length > 0) {
                 const before = driveFiles.length;
@@ -297,7 +307,7 @@ export async function POST(request: Request) {
           const wordCount = text.split(/\s+/).length;
           if (wordCount <= 4 && !isConversationalQuery(text)) {
             const dbFile = await getFileByIdOrNameOrMessageId(text);
-            if (dbFile) {
+            if (dbFile && !dbFile.filename.toLowerCase().includes('midterm')) {
               try {
                 await sendAndLogTextMessage(sender, `Found file: ${dbFile.filename}`);
                 await sendFileToUser(sender, dbFile);
@@ -308,10 +318,11 @@ export async function POST(request: Request) {
             }
 
             const driveFiles = await searchGDriveFiles(text);
-            if (driveFiles.length > 0) {
+            const filteredDriveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
+            if (filteredDriveFiles.length > 0) {
               try {
-                await sendAndLogTextMessage(sender, `Found: ${driveFiles[0].name}`);
-                await sendGDriveFileToUser(sender, driveFiles[0]);
+                await sendAndLogTextMessage(sender, `Found: ${filteredDriveFiles[0].name}`);
+                await sendGDriveFileToUser(sender, filteredDriveFiles[0]);
                 return;
               } catch (err: any) {
                 addLog('error', `Direct GDrive send error: ${err.message}`);
@@ -343,14 +354,15 @@ export async function POST(request: Request) {
             if (intent.filename) {
               const { contextTerms } = extractSmartSearchParams(text);
               const dbFile = await getFileByIdOrNameOrMessageId(intent.filename);
-              if (dbFile) {
+              if (dbFile && !dbFile.filename.toLowerCase().includes('midterm')) {
                 await sendAndLogTextMessage(sender, intent.reply || "Here is your file.");
                 await sendFileToUser(sender, dbFile);
               } else {
                 const driveFiles = await searchGDriveFiles(intent.filename, contextTerms);
-                if (driveFiles.length > 0) {
+                const filteredDriveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
+                if (filteredDriveFiles.length > 0) {
                   await sendAndLogTextMessage(sender, intent.reply || "Here is your file.");
-                  await sendGDriveFileToUser(sender, driveFiles[0]);
+                  await sendGDriveFileToUser(sender, filteredDriveFiles[0]);
                 } else {
                   await sendAndLogTextMessage(sender, `Sorry, couldn't find "${intent.filename}".`);
                 }
