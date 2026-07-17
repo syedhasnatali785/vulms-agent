@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractCourseKeywords, getFilesByKeywords } from '@/lib/supabase';
+import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractCourseKeywords, getFilesByKeywords, saveMessage } from '@/lib/supabase';
 import { downloadWhatsAppMedia, sendTextMessage, sendMediaMessage } from '@/lib/whatsapp';
 import { uploadFileToR2, getFileUrl } from '@/lib/r2';
 import { processUserIntent } from '@/lib/ai';
@@ -27,17 +27,10 @@ function isDuplicateMessage(messageId: string): boolean {
   return false;
 }
 
-export async function GET(request: Request) {
-  const { searchParams } = new URL(request.url);
-  const mode = searchParams.get('hub.mode');
-  const token = searchParams.get('hub.verify_token');
-  const challenge = searchParams.get('hub.challenge');
-
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    return new NextResponse(challenge, { status: 200 });
-  }
-
-  return new NextResponse('Forbidden', { status: 403 });
+/** Helper: sends a text message and logs it to Supabase */
+async function sendAndLogTextMessage(to: string, text: string) {
+  await sendTextMessage(to, text);
+  await saveMessage(to, text, 'outgoing');
 }
 
 /** Helper: resolve a local file record to a media message sent to the user */
@@ -93,7 +86,7 @@ export async function POST(request: Request) {
       const caption = message[message.type].caption || '';
       
       try {
-        await sendTextMessage(sender, "Downloading and saving your file...");
+        await sendAndLogTextMessage(sender, "Downloading and saving your file...");
         const { buffer, mimeType } = await downloadWhatsAppMedia(mediaId);
         
         // Generate a filename or use original filename/caption
@@ -132,10 +125,10 @@ export async function POST(request: Request) {
         successMessage += `✉️ Message ID: ${messageId}\n\n` +
           `You can retrieve this file anytime by typing its name or course code (e.g. "eng201").`;
         
-        await sendTextMessage(sender, successMessage);
+        await sendAndLogTextMessage(sender, successMessage);
       } catch (e: any) {
         console.error("Upload Error:", e);
-        await sendTextMessage(sender, "Failed to process the upload. Make sure the file is supported.");
+        await sendAndLogTextMessage(sender, "Failed to process the upload. Make sure the file is supported.");
       }
       return new NextResponse('OK', { status: 200 });
     }
@@ -143,6 +136,9 @@ export async function POST(request: Request) {
     // 2. Handle Text Messages
     if (message.type === 'text') {
       const text = message.text.body.trim();
+
+      // Log incoming text message to Supabase
+      await saveMessage(sender, text, 'incoming');
 
       // ── Step 2a: Explicit "retrieve/get/download <query>" commands ──
       const retrieveMatch = text.match(/^(?:retrieve|get|download)\s+(.+)$/i);
@@ -153,11 +149,11 @@ export async function POST(request: Request) {
         const dbFile = await getFileByIdOrNameOrMessageId(query);
         if (dbFile) {
           try {
-            await sendTextMessage(sender, `Here is your file: ${dbFile.filename}`);
+            await sendAndLogTextMessage(sender, `Here is your file: ${dbFile.filename}`);
             await sendFileToUser(sender, dbFile);
           } catch (err) {
             console.error("Error sending retrieved file:", err);
-            await sendTextMessage(sender, "Sorry, I found the file but failed to retrieve it from storage.");
+            await sendAndLogTextMessage(sender, "Sorry, I found the file but failed to retrieve it from storage.");
           }
           return new NextResponse('OK', { status: 200 });
         }
@@ -167,16 +163,16 @@ export async function POST(request: Request) {
         if (driveFiles.length > 0) {
           const driveFile = driveFiles[0];
           try {
-            await sendTextMessage(sender, `Here is your file: ${driveFile.name}`);
+            await sendAndLogTextMessage(sender, `Here is your file: ${driveFile.name}`);
             await sendGDriveFileToUser(sender, driveFile);
           } catch (err) {
             console.error("Error sending Google Drive file:", err);
-            await sendTextMessage(sender, "Sorry, I found the file on Google Drive but failed to send it.");
+            await sendAndLogTextMessage(sender, "Sorry, I found the file on Google Drive but failed to send it.");
           }
           return new NextResponse('OK', { status: 200 });
         }
 
-        await sendTextMessage(sender, `Sorry, I couldn't find any file matching "${query}".`);
+        await sendAndLogTextMessage(sender, `Sorry, I couldn't find any file matching "${query}".`);
         return new NextResponse('OK', { status: 200 });
       }
 
@@ -202,7 +198,7 @@ export async function POST(request: Request) {
 
         const totalFilesCount = matchingDbFiles.length + uniqueDriveFiles.length;
         if (totalFilesCount > 0) {
-          await sendTextMessage(sender, `Found ${totalFilesCount} file(s) matching your request:`);
+          await sendAndLogTextMessage(sender, `Found ${totalFilesCount} file(s) matching your request:`);
           
           // Send Supabase files
           for (const file of matchingDbFiles) {
@@ -224,7 +220,7 @@ export async function POST(request: Request) {
           return new NextResponse('OK', { status: 200 });
         }
         
-        await sendTextMessage(sender, `No files found for course code "${courseKeywords[0]}". Files may not have been uploaded yet.`);
+        await sendAndLogTextMessage(sender, `No files found for course code "${courseKeywords[0]}". Files may not have been uploaded yet.`);
         return new NextResponse('OK', { status: 200 });
       }
 
@@ -235,7 +231,7 @@ export async function POST(request: Request) {
         const dbFile = await getFileByIdOrNameOrMessageId(text);
         if (dbFile) {
           try {
-            await sendTextMessage(sender, `Found matching file: ${dbFile.filename}`);
+            await sendAndLogTextMessage(sender, `Found matching file: ${dbFile.filename}`);
             await sendFileToUser(sender, dbFile);
             return new NextResponse('OK', { status: 200 });
           } catch (err) {
@@ -248,7 +244,7 @@ export async function POST(request: Request) {
         if (driveFiles.length > 0) {
           const driveFile = driveFiles[0];
           try {
-            await sendTextMessage(sender, `Found matching Google Drive file: ${driveFile.name}`);
+            await sendAndLogTextMessage(sender, `Found matching Google Drive file: ${driveFile.name}`);
             await sendGDriveFileToUser(sender, driveFile);
             return new NextResponse('OK', { status: 200 });
           } catch (err) {
@@ -274,9 +270,9 @@ export async function POST(request: Request) {
           if (isSenderAdmin && intent.newNumber) {
             const success = await addAdmin(intent.newNumber, sender);
             const msg = success ? `Successfully added ${intent.newNumber} as admin.` : "Failed to add admin.";
-            await sendTextMessage(sender, intent.reply || msg);
+            await sendAndLogTextMessage(sender, intent.reply || msg);
           } else {
-            await sendTextMessage(sender, "Only existing admins can add new admins.");
+            await sendAndLogTextMessage(sender, "Only existing admins can add new admins.");
           }
           break;
 
@@ -286,7 +282,7 @@ export async function POST(request: Request) {
               // 1. Try Supabase first
               const dbFile = await getFileByIdOrNameOrMessageId(intent.filename);
               if (dbFile) {
-                await sendTextMessage(sender, intent.reply || "Here is the file you requested.");
+                await sendAndLogTextMessage(sender, intent.reply || "Here is the file you requested.");
                 await sendFileToUser(sender, dbFile);
                 break;
               }
@@ -295,21 +291,21 @@ export async function POST(request: Request) {
               const driveFiles = await searchGDriveFiles(intent.filename);
               if (driveFiles.length > 0) {
                 const driveFile = driveFiles[0];
-                await sendTextMessage(sender, intent.reply || "Here is the file you requested.");
+                await sendAndLogTextMessage(sender, intent.reply || "Here is the file you requested.");
                 await sendGDriveFileToUser(sender, driveFile);
               } else {
-                await sendTextMessage(sender, `Sorry, I couldn't find a file named "${intent.filename}".`);
+                await sendAndLogTextMessage(sender, `Sorry, I couldn't find a file named "${intent.filename}".`);
               }
             } catch (err) {
               console.error("Error in AI send_file intent:", err);
-              await sendTextMessage(sender, "Sorry, I found the file but failed to send it. Please try again.");
+              await sendAndLogTextMessage(sender, "Sorry, I found the file but failed to send it. Please try again.");
             }
           }
           break;
 
         case 'chat':
         default:
-          await sendTextMessage(sender, intent.reply || "I'm not sure how to help with that.");
+          await sendAndLogTextMessage(sender, intent.reply || "I'm not sure how to help with that.");
           break;
       }
     }

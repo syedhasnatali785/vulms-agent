@@ -220,3 +220,40 @@ export async function getFilesByKeywords(keywords: string[]) {
   }
   return allFiles;
 }
+
+export async function saveMessage(sender: string, text: string, direction: 'incoming' | 'outgoing') {
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .insert([{ sender, text, direction }])
+      .select();
+    
+    if (error) {
+      console.error('Error saving message in Supabase (make sure the messages table is created):', error);
+      return null;
+    }
+    return data?.[0] || null;
+  } catch (err) {
+    console.error('Exception saving message in Supabase:', err);
+    return null;
+  }
+}
+
+export async function getMessages(limit = 100) {
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+      
+    if (error) {
+      console.error('Error fetching messages from Supabase:', error);
+      return [];
+    }
+    return data || [];
+  } catch (err) {
+    console.error('Exception fetching messages from Supabase:', err);
+    return [];
+  }
+}
