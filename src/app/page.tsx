@@ -16,6 +16,12 @@ interface LogEntry {
   message: string;
 }
 
+interface DatesheetState {
+  status: 'not_launched' | 'launched';
+  lastChecked: string | null;
+  totalNotified: number;
+}
+
 type Tab = 'inbox' | 'logs';
 
 export default function Home() {
@@ -26,6 +32,7 @@ export default function Home() {
   const [loading, setLoading] = useState<boolean>(true);
   const [pollingActive, setPollingActive] = useState<boolean>(true);
   const [stats, setStats] = useState<any>(null);
+  const [datesheet, setDatesheet] = useState<DatesheetState | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>('inbox');
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -50,11 +57,28 @@ export default function Home() {
     } catch (e) {}
   };
 
-  useEffect(() => { fetchMessages(); fetchStats(); fetchLogs(); }, []);
+  const fetchDatesheet = async () => {
+    try {
+      const res = await fetch('/api/datesheet');
+      if (res.ok) setDatesheet(await res.json());
+    } catch (e) {}
+  };
+
+  useEffect(() => {
+    fetchMessages();
+    fetchStats();
+    fetchLogs();
+    fetchDatesheet();
+  }, []);
 
   useEffect(() => {
     if (!pollingActive) return;
-    const interval = setInterval(() => { fetchMessages(); fetchStats(); fetchLogs(); }, 5000);
+    const interval = setInterval(() => {
+      fetchMessages();
+      fetchStats();
+      fetchLogs();
+      fetchDatesheet();
+    }, 5000);
     return () => clearInterval(interval);
   }, [pollingActive]);
 
@@ -92,7 +116,7 @@ export default function Home() {
             </span>
             <h1 className="font-semibold text-lg tracking-tight">LMS Agent</h1>
           </div>
-          <button onClick={() => { fetchMessages(); fetchStats(); fetchLogs(); }} className="p-1.5 hover:bg-zinc-800 rounded-lg text-zinc-400 hover:text-zinc-100 transition-colors">⟳</button>
+          <button onClick={() => { fetchMessages(); fetchStats(); fetchLogs(); fetchDatesheet(); }} className="p-1.5 hover:bg-zinc-800 rounded-lg text-zinc-400 hover:text-zinc-100 transition-colors">⟳</button>
         </div>
 
         {/* Tab Switcher */}
@@ -144,6 +168,35 @@ export default function Home() {
             )}
           </div>
         )}
+
+        {/* datesheet.vu.edu.pk Status Monitor Widget */}
+        <div className="p-4 border-t border-zinc-800 bg-zinc-950/40">
+          <div className="text-xs font-semibold tracking-wider text-zinc-500 uppercase mb-3">Datesheet Monitor</div>
+          {datesheet ? (
+            <div className="space-y-2 text-xs">
+              <div className="flex justify-between items-center">
+                <span className="text-zinc-400">Portal Status</span>
+                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                  datesheet.status === 'launched' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                }`}>
+                  {datesheet.status === 'launched' ? '🚀 Launched' : '⏳ Not Launched'}
+                </span>
+              </div>
+              <div className="flex justify-between items-center text-zinc-400">
+                <span>Notified Students</span>
+                <span className="text-zinc-200 font-semibold">{datesheet.totalNotified}</span>
+              </div>
+              <div className="flex justify-between items-center text-zinc-400">
+                <span>Last Checked</span>
+                <span className="text-zinc-300 truncate max-w-[120px]" title={datesheet.lastChecked ? new Date(datesheet.lastChecked).toLocaleString() : 'Never'}>
+                  {datesheet.lastChecked ? new Date(datesheet.lastChecked).toLocaleTimeString() : 'Never'}
+                </span>
+              </div>
+            </div>
+          ) : (
+            <div className="text-zinc-600 text-xs text-center">Loading monitor status...</div>
+          )}
+        </div>
 
         {/* Server Stats */}
         <div className="p-4 border-t border-zinc-800 bg-zinc-950/20">

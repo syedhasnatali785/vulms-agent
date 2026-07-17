@@ -293,3 +293,20 @@ export async function getLogsDb(limit = 100) {
   }
 }
 
+export async function getUniqueStudents(): Promise<string[]> {
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .select('sender')
+      .eq('direction', 'incoming');
+    if (error || !data) return [];
+    
+    // Deduplicate in JS to avoid complexity with distinct select statements
+    const senders = data.map((m: any) => m.sender).filter(Boolean);
+    return Array.from(new Set(senders));
+  } catch (err) {
+    console.error('Exception fetching unique students:', err);
+    return [];
+  }
+}
+
