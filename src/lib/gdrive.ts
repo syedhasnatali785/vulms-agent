@@ -84,7 +84,7 @@ export async function getFolderIds(): Promise<string[]> {
  * Searches for files in the designated public Google Drive folders (including all subfolders).
  * Case-insensitive search on filename.
  */
-export async function searchGDriveFiles(query: string): Promise<GDriveFile[]> {
+export async function searchGDriveFiles(query: string, contextTerms: string[] = []): Promise<GDriveFile[]> {
   if (!GOOGLE_API_KEY) {
     console.warn('GOOGLE_API_KEY is not defined in environment variables. Google Drive search bypassed.');
     return [];
@@ -103,11 +103,14 @@ export async function searchGDriveFiles(query: string): Promise<GDriveFile[]> {
     chunks.push(folderIds.slice(i, i + chunkSize));
   }
 
+  // Build the context term filters for the query string (e.g. "and name contains 'final'")
+  const contextFilters = contextTerms.map(term => `and name contains '${term.replace(/'/g, "\\'")}'`).join(' ');
+
   // Fetch search results for each chunk in parallel to minimize response latency
   const searchPromises = chunks.map(async (folderChunk) => {
     try {
       const parentFilter = folderChunk.map(id => `'${id}' in parents`).join(' or ');
-      const q = `(${parentFilter}) and name contains '${escapedQuery}' and trashed = false`;
+      const q = `(${parentFilter}) and name contains '${escapedQuery}' ${contextFilters} and trashed = false`;
 
       const response = await axios.get('https://www.googleapis.com/drive/v3/files', {
         params: {

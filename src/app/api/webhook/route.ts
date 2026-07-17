@@ -49,6 +49,29 @@ function isConversationalQuery(text: string): boolean {
 }
 
 /**
+ * Parses user prompt to find content-type context constraints (handouts, highlighted, mids, finals)
+ */
+function getSearchContextTerms(text: string): string[] {
+  const lowerText = text.toLowerCase();
+  const terms: string[] = [];
+
+  if (lowerText.includes('highlight')) {
+    terms.push('highlight');
+  }
+  if (lowerText.includes('handout')) {
+    terms.push('handout');
+  }
+  if (/\b(mid|mids|midterm|mid-term)\b/i.test(lowerText)) {
+    terms.push('mid');
+  }
+  if (/\b(final|finals|finalterm|final-term)\b/i.test(lowerText)) {
+    terms.push('final');
+  }
+
+  return terms;
+}
+
+/**
  * Filters a list of files based on keywords inside the user's message (e.g. handouts, highlighted, mids, finals)
  */
 function filterFilesByContext(files: any[], text: string): any[] {
@@ -214,6 +237,7 @@ export async function POST(request: Request) {
       const retrieveMatch = text.match(/^(?:retrieve|get|download)\s+(.+)$/i);
       if (retrieveMatch) {
         const query = retrieveMatch[1].trim();
+        const contextTerms = getSearchContextTerms(text);
         
         // 1. Try Supabase first
         const dbFile = await getFileByIdOrNameOrMessageId(query);
@@ -229,10 +253,9 @@ export async function POST(request: Request) {
         }
 
         // 2. Try Google Drive (directly query and send download url)
-        const driveFiles = await searchGDriveFiles(query);
+        const driveFiles = await searchGDriveFiles(query, contextTerms);
         if (driveFiles.length > 0) {
-          // If query has course parameters, apply filters
-          const filteredDrive = filterFilesByContext(driveFiles, query);
+          const filteredDrive = filterFilesByContext(driveFiles, text);
           if (filteredDrive.length > 0) {
             const driveFile = filteredDrive[0];
             try {
@@ -253,12 +276,13 @@ export async function POST(request: Request) {
       // ── Step 2b: Course code keyword matching (e.g. "eng201", "send me CS 101 notes") ──
       const courseKeywords = extractCourseKeywords(text);
       if (courseKeywords.length > 0) {
-        let matchingDbFiles = await getFilesByKeywords(courseKeywords);
+        const contextTerms = getSearchContextTerms(text);
+        let matchingDbFiles = await getFilesByKeywords(courseKeywords, contextTerms);
         
         // Query Google Drive matching files in real-time
         const matchingDriveFiles: any[] = [];
         for (const kw of courseKeywords) {
-          const driveFiles = await searchGDriveFiles(kw);
+          const driveFiles = await searchGDriveFiles(kw, contextTerms);
           matchingDriveFiles.push(...driveFiles);
         }
         
@@ -297,15 +321,16 @@ export async function POST(request: Request) {
           }
           return new NextResponse('OK', { status: 200 });
         }
-        // Course code detected but no files matched filters
-        await sendAndLogTextMessage(sender, `No matching files found for course code and keyword filters in "${text}".`);
-        return new NextResponse('OK', { status: 200 });
+        // Course code detected but no files matched filters -> let it fall through to the LLM
+        console.log(`Course keyword match returned 0 files for "${text}". Handing over to Cloudflare AI Workers...`);
       }
 
       // ── Step 2c: Short direct input (filename, file ID, message ID) ──
       // Bypasses if message is a conversational greeting/short response (like "Hi", "Hello")
       const wordCount = text.split(/\s+/).length;
       if (wordCount <= 4 && !isConversationalQuery(text)) {
+        const contextTerms = getSearchContextTerms(text);
+
         // 1. Try Supabase
         const dbFile = await getFileByIdOrNameOrMessageId(text);
         if (dbFile) {
@@ -322,7 +347,7 @@ export async function POST(request: Request) {
         }
 
         // 2. Try Google Drive
-        const driveFiles = await searchGDriveFiles(text);
+        const driveFiles = await searchGDriveFiles(text, contextTerms);
         if (driveFiles.length > 0) {
           const filtered = filterFilesByContext(driveFiles, text);
           if (filtered.length > 0) {
@@ -364,6 +389,8 @@ export async function POST(request: Request) {
         case 'send_file':
           if (intent.filename) {
             try {
+              const contextTerms = getSearchContextTerms(text);
+
               // 1. Try Supabase first
               const dbFile = await getFileByIdOrNameOrMessageId(intent.filename);
               if (dbFile) {
@@ -376,7 +403,7 @@ export async function POST(request: Request) {
               }
 
               // 2. Try Google Drive (directly query and send download url)
-              const driveFiles = await searchGDriveFiles(intent.filename);
+              const driveFiles = await searchGDriveFiles(intent.filename, contextTerms);
               if (driveFiles.length > 0) {
                 const filtered = filterFilesByContext(driveFiles, text);
                 if (filtered.length > 0) {

@@ -194,15 +194,21 @@ export function extractKeywords(text: string): string[] {
   return extractCourseKeywords(text);
 }
 
-export async function getFilesByKeywords(keywords: string[]) {
+export async function getFilesByKeywords(keywords: string[], contextTerms: string[] = []) {
   if (keywords.length === 0) return [];
 
-  const queries = keywords.map(keyword =>
-    supabase
+  const queries = keywords.map(keyword => {
+    let query = supabase
       .from('files')
       .select('id, filename, r2_key, mime_type')
-      .ilike('filename', `%${keyword}%`)
-  );
+      .ilike('filename', `%${keyword}%`);
+
+    // Chain additional filters for context terms (acts as an AND filter)
+    for (const term of contextTerms) {
+      query = query.ilike('filename', `%${term}%`);
+    }
+    return query;
+  });
 
   const results = await Promise.all(queries);
   const allFiles: any[] = [];
