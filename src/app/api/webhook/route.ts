@@ -327,7 +327,7 @@ export async function POST(request: Request) {
           addLog('info', `AI intent: ${intent.type}`);
         } catch (aiErr: any) {
           addLog('error', `AI error: ${aiErr.message}`);
-          intent = { type: 'chat', reply: "I'm here to help! Send a course code like 'cs405 final' to get files." };
+          intent = { type: 'chat', reply: "I'm SYED 1.2 Ai LLM Model Built by Syed Hasnat Ali. I will help you provide you all files. i got training for months. send me a course code like cs101. so i'll process your message and provide you with my best. did you get it?" };
         }
 
         switch (intent.type) {
