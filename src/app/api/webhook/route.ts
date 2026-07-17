@@ -36,9 +36,9 @@ const MAX_LOGS = 200;
 function addLog(level: 'info' | 'warn' | 'error', message: string) {
   logsBuffer.unshift({ timestamp: new Date().toISOString(), level, message });
   if (logsBuffer.length > MAX_LOGS) logsBuffer.pop();
-  
+
   // Log asynchronously to Supabase logs table (non-blocking)
-  saveLog(level, message).catch(() => {});
+  saveLog(level, message).catch(() => { });
 }
 
 export function getLogs(): LogEntry[] {
@@ -70,11 +70,11 @@ function isConversationalQuery(text: string): boolean {
  */
 function extractSmartSearchParams(text: string): { courseCode: string | null; contextTerms: string[]; excludeTerms: string[] } {
   const lowerText = text.toLowerCase();
-  
+
   // Extract course code (letters + digits pattern like cs405, eng201)
   const codeMatch = lowerText.match(/\b([a-z]{2,5})\s*[-_]?\s*(\d{2,4})\b/);
   const courseCode = codeMatch ? `${codeMatch[1]}${codeMatch[2]}` : null;
-  
+
   const terms: string[] = [];
 
   const wantsFinal = lowerText.includes('final');
@@ -87,7 +87,7 @@ function extractSmartSearchParams(text: string): { courseCode: string | null; co
       if (word.includes('final') || word.includes('mid') || word.includes('handout') || word.includes('highlight')) {
         // Add the exact word typed by the user (e.g., 'finale', 'mids')
         terms.push(word);
-        
+
         // Also add standard normalized root terms to maximize hits
         if (word.includes('final') && word !== 'final') {
           terms.push('final');
@@ -135,8 +135,8 @@ async function sendFileToUser(sender: string, file: any) {
   }
   const fileUrl = await getFileUrl(file.r2_key);
   const mediaType = file.mime_type.startsWith('image') ? 'image'
-                   : file.mime_type.startsWith('video') ? 'video'
-                   : 'document' as const;
+    : file.mime_type.startsWith('video') ? 'video'
+      : 'document' as const;
   await sendMediaMessage(sender, mediaType, fileUrl, file.filename);
   addLog('info', `→ Sent file "${file.filename}" to ${sender}`);
 }
@@ -148,8 +148,8 @@ async function sendGDriveFileToUser(sender: string, file: any) {
   }
   const fileUrl = `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media&key=${process.env.GOOGLE_API_KEY}`;
   const mediaType = file.mimeType.startsWith('image') ? 'image'
-                   : file.mimeType.startsWith('video') ? 'video'
-                   : 'document' as const;
+    : file.mimeType.startsWith('video') ? 'video'
+      : 'document' as const;
   await sendMediaMessage(sender, mediaType, fileUrl, file.name);
   addLog('info', `→ Sent GDrive file "${file.name}" to ${sender}`);
 }
@@ -338,7 +338,7 @@ export async function POST(request: Request) {
           addLog('info', `AI intent: ${intent.type}`);
         } catch (aiErr: any) {
           addLog('error', `AI error: ${aiErr.message}`);
-          intent = { type: 'chat', reply: "I'm SYED 1.2 Ai LLM Model Built by Syed Hasnat Ali. I will help you provide you all files. i got training for months. send me a course code like cs101. so i'll process your message and provide you with my best. did you get it?" };
+          intent = { type: 'chat', reply: "I'm SYED 1.2 Ai LLM Model Built by Syed Hasnat Ali. I will help you provide you all files. send me a course code like cs101. so i'll process your message and provide you with my best efforts." };
         }
 
         switch (intent.type) {
