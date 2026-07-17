@@ -144,6 +144,19 @@ async function sendGDriveFileToUser(sender: string, file: any) {
   await sendMediaMessage(sender, mediaType, fileUrl, file.name);
 }
 
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const mode = searchParams.get('hub.mode');
+  const token = searchParams.get('hub.verify_token');
+  const challenge = searchParams.get('hub.challenge');
+
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    return new NextResponse(challenge, { status: 200 });
+  }
+
+  return new NextResponse('Forbidden', { status: 403 });
+}
+
 export async function POST(request: Request) {
   try {
     const body = await request.json();
@@ -156,279 +169,285 @@ export async function POST(request: Request) {
     const entry = body.entry?.[0];
     const changes = entry?.changes?.[0];
     const value = changes?.value;
-    const message = value?.messages?.[0];
+    const messages = value?.messages || [];
     
-    // Acknowledge immediately to avoid Meta retries if no message
-    if (!message) {
+    // Acknowledge immediately if there are no messages
+    if (messages.length === 0) {
       return new NextResponse('OK', { status: 200 });
     }
 
-    // Deduplication check
-    const messageId = message.id;
-    if (messageId && isDuplicateMessage(messageId)) {
-      console.log(`Duplicate message ignored: ${messageId}`);
-      return new NextResponse('OK', { status: 200 });
-    }
-
-    const sender = message.from;
-    const isSenderAdmin = await isAdmin(sender);
-
-    // 1. Handle File Uploads (Media)
-    if (message.type === 'image' || message.type === 'video' || message.type === 'document') {
-      const mediaId = message[message.type].id;
-      const caption = message[message.type].caption || '';
-      
-      try {
-        await sendAndLogTextMessage(sender, "Downloading and saving your file...");
-        const { buffer, mimeType } = await downloadWhatsAppMedia(mediaId);
-        
-        // Generate a filename or use original filename/caption
-        let rawFilename = '';
-        if (message.type === 'document' && message.document?.filename) {
-          rawFilename = message.document.filename;
-        } else {
-          rawFilename = caption || `file_${Date.now()}`;
-        }
-        
-        const ext = mimeType.split('/')[1] || 'bin';
-        const safeExt = ext.split(';')[0] || 'bin';
-        
-        // Ensure the filename has the correct extension if not already present
-        let filename = rawFilename.replace(/\s+/g, '_');
-        if (!filename.toLowerCase().endsWith(`.${safeExt.toLowerCase()}`)) {
-          if (mimeType === 'application/pdf' && !filename.toLowerCase().endsWith('.pdf')) {
-            filename = `${filename}.pdf`;
-          } else {
-            filename = `${filename}.${safeExt}`;
-          }
-        }
-        
-        // Store directly as uploads/filename in R2 so the key matches the filename
-        const r2Key = `uploads/${filename}`;
-        
-        await uploadFileToR2(r2Key, buffer, mimeType);
-        const savedFile = await saveFileMetadata(filename, r2Key, mimeType, sender);
-        
-        let successMessage = `File successfully saved!\n\n` +
-          `📂 Filename: ${filename}\n`;
-        
-        if (savedFile) {
-          successMessage += `🆔 File ID: ${savedFile.id}\n`;
-        }
-        successMessage += `✉️ Message ID: ${messageId}\n\n` +
-          `You can retrieve this file anytime by typing its name or course code (e.g. "eng201").`;
-        
-        await sendAndLogTextMessage(sender, successMessage);
-      } catch (e: any) {
-        console.error("Upload Error:", e);
-        await sendAndLogTextMessage(sender, "Failed to process the upload. Make sure the file is supported.");
-      }
-      return new NextResponse('OK', { status: 200 });
-    }
-
-    // 2. Handle Text Messages
-    if (message.type === 'text') {
-      const text = message.text.body.trim();
-
-      // Log incoming text message to Supabase
-      await saveMessage(sender, text, 'incoming');
-
-      // ── Step 2a: Explicit "retrieve/get/download <query>" commands ──
-      const retrieveMatch = text.match(/^(?:retrieve|get|download)\s+(.+)$/i);
-      if (retrieveMatch) {
-        const query = retrieveMatch[1].trim();
-        const contextTerms = getSearchContextTerms(text);
-        
-        // 1. Try Supabase first
-        const dbFile = await getFileByIdOrNameOrMessageId(query);
-        if (dbFile) {
-          try {
-            await sendAndLogTextMessage(sender, `Here is your file: ${dbFile.filename}`);
-            await sendFileToUser(sender, dbFile);
-          } catch (err) {
-            console.error("Error sending retrieved file:", err);
-            await sendAndLogTextMessage(sender, "Sorry, I found the file but failed to retrieve it from storage.");
-          }
-          return new NextResponse('OK', { status: 200 });
-        }
-
-        // 2. Try Google Drive (directly query and send download url)
-        const driveFiles = await searchGDriveFiles(query, contextTerms);
-        if (driveFiles.length > 0) {
-          const filteredDrive = filterFilesByContext(driveFiles, text);
-          if (filteredDrive.length > 0) {
-            const driveFile = filteredDrive[0];
-            try {
-              await sendAndLogTextMessage(sender, `Here is your file: ${driveFile.name}`);
-              await sendGDriveFileToUser(sender, driveFile);
-            } catch (err) {
-              console.error("Error sending Google Drive file:", err);
-              await sendAndLogTextMessage(sender, "Sorry, I found the file on Google Drive but failed to send it.");
-            }
-            return new NextResponse('OK', { status: 200 });
-          }
-        }
-
-        await sendAndLogTextMessage(sender, `Sorry, I couldn't find any file matching "${query}".`);
-        return new NextResponse('OK', { status: 200 });
+    // Process all messages in the batch concurrently in parallel
+    const processPromises = messages.map(async (message: any) => {
+      // Deduplication check per message
+      const messageId = message.id;
+      if (messageId && isDuplicateMessage(messageId)) {
+        console.log(`Duplicate message ignored: ${messageId}`);
+        return;
       }
 
-      // ── Step 2b: Course code keyword matching (e.g. "eng201", "send me CS 101 notes") ──
-      const courseKeywords = extractCourseKeywords(text);
-      if (courseKeywords.length > 0) {
-        const contextTerms = getSearchContextTerms(text);
-        let matchingDbFiles = await getFilesByKeywords(courseKeywords, contextTerms);
-        
-        // Query Google Drive matching files in real-time
-        const matchingDriveFiles: any[] = [];
-        for (const kw of courseKeywords) {
-          const driveFiles = await searchGDriveFiles(kw, contextTerms);
-          matchingDriveFiles.push(...driveFiles);
-        }
-        
-        // Deduplicate drive files by ID
-        const seenDriveIds = new Set<string>();
-        const uniqueDriveFiles = matchingDriveFiles.filter(f => {
-          if (seenDriveIds.has(f.id)) return false;
-          seenDriveIds.add(f.id);
-          return true;
-        });
+      const sender = message.from;
+      const isSenderAdmin = await isAdmin(sender);
 
-        // Apply keyword context filtering (handouts, highlighted, mids, finals)
-        const filteredDbFiles = filterFilesByContext(matchingDbFiles, text);
-        const filteredDriveFiles = filterFilesByContext(uniqueDriveFiles, text);
-
-        const totalFilesCount = filteredDbFiles.length + filteredDriveFiles.length;
-        if (totalFilesCount > 0) {
-          await sendAndLogTextMessage(sender, `Found ${totalFilesCount} file(s) matching your request:`);
+      // 1. Handle File Uploads (Media)
+      if (message.type === 'image' || message.type === 'video' || message.type === 'document') {
+        const mediaId = message[message.type].id;
+        const caption = message[message.type].caption || '';
+        
+        try {
+          await sendAndLogTextMessage(sender, "Downloading and saving your file...");
+          const { buffer, mimeType } = await downloadWhatsAppMedia(mediaId);
           
-          // Send Supabase files
-          for (const file of filteredDbFiles) {
-            try {
-              await sendFileToUser(sender, file);
-            } catch (err) {
-              console.error(`Error sending DB file ${file.filename}:`, err);
-            }
-          }
-
-          // Send Google Drive files directly (no downloading/uploading)
-          for (const file of filteredDriveFiles) {
-            try {
-              await sendGDriveFileToUser(sender, file);
-            } catch (err) {
-              console.error(`Error sending Google Drive file ${file.name}:`, err);
-            }
-          }
-          return new NextResponse('OK', { status: 200 });
-        }
-        // Course code detected but no files matched filters -> let it fall through to the LLM
-        console.log(`Course keyword match returned 0 files for "${text}". Handing over to Cloudflare AI Workers...`);
-      }
-
-      // ── Step 2c: Short direct input (filename, file ID, message ID) ──
-      // Bypasses if message is a conversational greeting/short response (like "Hi", "Hello")
-      const wordCount = text.split(/\s+/).length;
-      if (wordCount <= 4 && !isConversationalQuery(text)) {
-        const contextTerms = getSearchContextTerms(text);
-
-        // 1. Try Supabase
-        const dbFile = await getFileByIdOrNameOrMessageId(text);
-        if (dbFile) {
-          const filtered = filterFilesByContext([dbFile], text);
-          if (filtered.length > 0) {
-            try {
-              await sendAndLogTextMessage(sender, `Found matching file: ${dbFile.filename}`);
-              await sendFileToUser(sender, dbFile);
-              return new NextResponse('OK', { status: 200 });
-            } catch (err) {
-              console.error(`Error sending direct DB file:`, err);
-            }
-          }
-        }
-
-        // 2. Try Google Drive
-        const driveFiles = await searchGDriveFiles(text, contextTerms);
-        if (driveFiles.length > 0) {
-          const filtered = filterFilesByContext(driveFiles, text);
-          if (filtered.length > 0) {
-            const driveFile = filtered[0];
-            try {
-              await sendAndLogTextMessage(sender, `Found matching Google Drive file: ${driveFile.name}`);
-              await sendGDriveFileToUser(sender, driveFile);
-              return new NextResponse('OK', { status: 200 });
-            } catch (err) {
-              console.error(`Error sending direct Drive file:`, err);
-            }
-          }
-        }
-      }
-
-      // ── Step 2d: AI intent resolution (conversational messages, complex requests) ──
-      let intent;
-      try {
-        intent = await processUserIntent(text, isSenderAdmin);
-      } catch (aiErr) {
-        console.error("AI processing error:", aiErr);
-        intent = {
-          type: 'chat',
-          reply: "I'm here to help! You can:\n• Upload files by sending them directly\n• Retrieve files by name or course code (e.g. \"eng201\")\n• Use \"retrieve <filename>\" for specific files"
-        };
-      }
-      
-      switch (intent.type) {
-        case 'add_admin':
-          if (isSenderAdmin && intent.newNumber) {
-            const success = await addAdmin(intent.newNumber, sender);
-            const msg = success ? `Successfully added ${intent.newNumber} as admin.` : "Failed to add admin.";
-            await sendAndLogTextMessage(sender, intent.reply || msg);
+          // Generate a filename or use original filename/caption
+          let rawFilename = '';
+          if (message.type === 'document' && message.document?.filename) {
+            rawFilename = message.document.filename;
           } else {
-            await sendAndLogTextMessage(sender, "Only existing admins can add new admins.");
+            rawFilename = caption || `file_${Date.now()}`;
           }
-          break;
-
-        case 'send_file':
-          if (intent.filename) {
-            try {
-              const contextTerms = getSearchContextTerms(text);
-
-              // 1. Try Supabase first
-              const dbFile = await getFileByIdOrNameOrMessageId(intent.filename);
-              if (dbFile) {
-                const filtered = filterFilesByContext([dbFile], text);
-                if (filtered.length > 0) {
-                  await sendAndLogTextMessage(sender, intent.reply || "Here is the file you requested.");
-                  await sendFileToUser(sender, dbFile);
-                  break;
-                }
-              }
-
-              // 2. Try Google Drive (directly query and send download url)
-              const driveFiles = await searchGDriveFiles(intent.filename, contextTerms);
-              if (driveFiles.length > 0) {
-                const filtered = filterFilesByContext(driveFiles, text);
-                if (filtered.length > 0) {
-                  const driveFile = filtered[0];
-                  await sendAndLogTextMessage(sender, intent.reply || "Here is the file you requested.");
-                  await sendGDriveFileToUser(sender, driveFile);
-                } else {
-                  await sendAndLogTextMessage(sender, `Sorry, no handouts/files matched your request details.`);
-                }
-              } else {
-                await sendAndLogTextMessage(sender, `Sorry, I couldn't find a file named "${intent.filename}".`);
-              }
-            } catch (err) {
-              console.error("Error in AI send_file intent:", err);
-              await sendAndLogTextMessage(sender, "Sorry, I found the file but failed to send it. Please try again.");
+          
+          const ext = mimeType.split('/')[1] || 'bin';
+          const safeExt = ext.split(';')[0] || 'bin';
+          
+          // Ensure the filename has the correct extension if not already present
+          let filename = rawFilename.replace(/\s+/g, '_');
+          if (!filename.toLowerCase().endsWith(`.${safeExt.toLowerCase()}`)) {
+            if (mimeType === 'application/pdf' && !filename.toLowerCase().endsWith('.pdf')) {
+              filename = `${filename}.pdf`;
+            } else {
+              filename = `${filename}.${safeExt}`;
             }
           }
-          break;
-
-        case 'chat':
-        default:
-          await sendAndLogTextMessage(sender, intent.reply || "I'm not sure how to help with that.");
-          break;
+          
+          // Store directly as uploads/filename in R2 so the key matches the filename
+          const r2Key = `uploads/${filename}`;
+          
+          await uploadFileToR2(r2Key, buffer, mimeType);
+          const savedFile = await saveFileMetadata(filename, r2Key, mimeType, sender);
+          
+          let successMessage = `File successfully saved!\n\n` +
+            `📂 Filename: ${filename}\n`;
+          
+          if (savedFile) {
+            successMessage += `🆔 File ID: ${savedFile.id}\n`;
+          }
+          successMessage += `✉️ Message ID: ${messageId}\n\n` +
+            `You can retrieve this file anytime by typing its name or course code (e.g. "eng201").`;
+          
+          await sendAndLogTextMessage(sender, successMessage);
+        } catch (e: any) {
+          console.error("Upload Error:", e);
+          await sendAndLogTextMessage(sender, "Failed to process the upload. Make sure the file is supported.");
+        }
+        return;
       }
-    }
+
+      // 2. Handle Text Messages
+      if (message.type === 'text') {
+        const text = message.text.body.trim();
+
+        // Log incoming text message to Supabase
+        await saveMessage(sender, text, 'incoming');
+
+        // ── Step 2a: Explicit "retrieve/get/download <query>" commands ──
+        const retrieveMatch = text.match(/^(?:retrieve|get|download)\s+(.+)$/i);
+        if (retrieveMatch) {
+          const query = retrieveMatch[1].trim();
+          const contextTerms = getSearchContextTerms(text);
+          
+          // 1. Try Supabase first
+          const dbFile = await getFileByIdOrNameOrMessageId(query);
+          if (dbFile) {
+            try {
+              await sendAndLogTextMessage(sender, `Here is your file: ${dbFile.filename}`);
+              await sendFileToUser(sender, dbFile);
+            } catch (err) {
+              console.error("Error sending retrieved file:", err);
+              await sendAndLogTextMessage(sender, "Sorry, I found the file but failed to retrieve it from storage.");
+            }
+            return;
+          }
+
+          // 2. Try Google Drive (directly query and send download url)
+          const driveFiles = await searchGDriveFiles(query, contextTerms);
+          if (driveFiles.length > 0) {
+            const filteredDrive = filterFilesByContext(driveFiles, text);
+            if (filteredDrive.length > 0) {
+              const driveFile = filteredDrive[0];
+              try {
+                await sendAndLogTextMessage(sender, `Here is your file: ${driveFile.name}`);
+                await sendGDriveFileToUser(sender, driveFile);
+              } catch (err) {
+                console.error("Error sending Google Drive file:", err);
+                await sendAndLogTextMessage(sender, "Sorry, I found the file on Google Drive but failed to send it.");
+              }
+              return;
+            }
+          }
+
+          await sendAndLogTextMessage(sender, `Sorry, I couldn't find any file matching "${query}".`);
+          return;
+        }
+
+        // ── Step 2b: Course code keyword matching (e.g. "eng201", "send me CS 101 notes") ──
+        const courseKeywords = extractCourseKeywords(text);
+        if (courseKeywords.length > 0) {
+          const contextTerms = getSearchContextTerms(text);
+          let matchingDbFiles = await getFilesByKeywords(courseKeywords, contextTerms);
+          
+          // Query Google Drive matching files in real-time
+          const matchingDriveFiles: any[] = [];
+          for (const kw of courseKeywords) {
+            const driveFiles = await searchGDriveFiles(kw, contextTerms);
+            matchingDriveFiles.push(...driveFiles);
+          }
+          
+          // Deduplicate drive files by ID
+          const seenDriveIds = new Set<string>();
+          const uniqueDriveFiles = matchingDriveFiles.filter(f => {
+            if (seenDriveIds.has(f.id)) return false;
+            seenDriveIds.add(f.id);
+            return true;
+          });
+
+          // Apply keyword context filtering (handouts, highlighted, mids, finals)
+          const filteredDbFiles = filterFilesByContext(matchingDbFiles, text);
+          const filteredDriveFiles = filterFilesByContext(uniqueDriveFiles, text);
+
+          const totalFilesCount = filteredDbFiles.length + filteredDriveFiles.length;
+          if (totalFilesCount > 0) {
+            await sendAndLogTextMessage(sender, `Found ${totalFilesCount} file(s) matching your request:`);
+            
+            // Send Supabase files
+            for (const file of filteredDbFiles) {
+              try {
+                await sendFileToUser(sender, file);
+              } catch (err) {
+                console.error(`Error sending DB file ${file.filename}:`, err);
+              }
+            }
+
+            // Send Google Drive files directly (no downloading/uploading)
+            for (const file of filteredDriveFiles) {
+              try {
+                await sendGDriveFileToUser(sender, file);
+              } catch (err) {
+                console.error(`Error sending Google Drive file ${file.name}:`, err);
+              }
+            }
+            return;
+          }
+          // Course code detected but no files matched filters -> let it fall through to the LLM
+          console.log(`Course keyword match returned 0 files for "${text}". Handing over to Cloudflare AI Workers...`);
+        }
+
+        // ── Step 2c: Short direct input (filename, file ID, message ID) ──
+        // Bypasses if message is a conversational greeting/short response (like "Hi", "Hello")
+        const wordCount = text.split(/\s+/).length;
+        if (wordCount <= 4 && !isConversationalQuery(text)) {
+          const contextTerms = getSearchContextTerms(text);
+
+          // 1. Try Supabase
+          const dbFile = await getFileByIdOrNameOrMessageId(text);
+          if (dbFile) {
+            const filtered = filterFilesByContext([dbFile], text);
+            if (filtered.length > 0) {
+              try {
+                await sendAndLogTextMessage(sender, `Found matching file: ${dbFile.filename}`);
+                await sendFileToUser(sender, dbFile);
+                return;
+              } catch (err) {
+                console.error(`Error sending direct DB file:`, err);
+              }
+            }
+          }
+
+          // 2. Try Google Drive
+          const driveFiles = await searchGDriveFiles(text, contextTerms);
+          if (driveFiles.length > 0) {
+            const filtered = filterFilesByContext(driveFiles, text);
+            if (filtered.length > 0) {
+              const driveFile = filtered[0];
+              try {
+                await sendAndLogTextMessage(sender, `Found matching Google Drive file: ${driveFile.name}`);
+                await sendGDriveFileToUser(sender, driveFile);
+                return;
+              } catch (err) {
+                console.error(`Error sending direct Drive file:`, err);
+              }
+            }
+          }
+        }
+
+        // ── Step 2d: AI intent resolution (conversational messages, complex requests) ──
+        let intent;
+        try {
+          intent = await processUserIntent(text, isSenderAdmin);
+        } catch (aiErr) {
+          console.error("AI processing error:", aiErr);
+          intent = {
+            type: 'chat',
+            reply: "I'm here to help! You can:\n• Upload files by sending them directly\n• Retrieve files by name or course code (e.g. \"eng201\")\n• Use \"retrieve <filename>\" for specific files"
+          };
+        }
+        
+        switch (intent.type) {
+          case 'add_admin':
+            if (isSenderAdmin && intent.newNumber) {
+              const success = await addAdmin(intent.newNumber, sender);
+              const msg = success ? `Successfully added ${intent.newNumber} as admin.` : "Failed to add admin.";
+              await sendAndLogTextMessage(sender, intent.reply || msg);
+            } else {
+              await sendAndLogTextMessage(sender, "Only existing admins can add new admins.");
+            }
+            break;
+
+          case 'send_file':
+            if (intent.filename) {
+              try {
+                const contextTerms = getSearchContextTerms(text);
+
+                // 1. Try Supabase first
+                const dbFile = await getFileByIdOrNameOrMessageId(intent.filename);
+                if (dbFile) {
+                  const filtered = filterFilesByContext([dbFile], text);
+                  if (filtered.length > 0) {
+                    await sendAndLogTextMessage(sender, intent.reply || "Here is the file you requested.");
+                    await sendFileToUser(sender, dbFile);
+                    break;
+                  }
+                }
+
+                // 2. Try Google Drive (directly query and send download url)
+                const driveFiles = await searchGDriveFiles(intent.filename, contextTerms);
+                if (driveFiles.length > 0) {
+                  const filtered = filterFilesByContext(driveFiles, text);
+                  if (filtered.length > 0) {
+                    const driveFile = filtered[0];
+                    await sendAndLogTextMessage(sender, intent.reply || "Here is the file you requested.");
+                    await sendGDriveFileToUser(sender, driveFile);
+                  } else {
+                    await sendAndLogTextMessage(sender, `Sorry, no handouts/files matched your request details.`);
+                  }
+                } else {
+                  await sendAndLogTextMessage(sender, `Sorry, I couldn't find a file named "${intent.filename}".`);
+                }
+              } catch (err) {
+                console.error("Error in AI send_file intent:", err);
+                await sendAndLogTextMessage(sender, "Sorry, I found the file but failed to send it. Please try again.");
+              }
+            }
+            break;
+
+          case 'chat':
+          default:
+            await sendAndLogTextMessage(sender, intent.reply || "I'm not sure how to help with that.");
+            break;
+        }
+      }
+    });
+
+    // Await execution of all webhook messages in the payload batch
+    await Promise.all(processPromises);
 
     return new NextResponse('OK', { status: 200 });
 
