@@ -3,7 +3,7 @@ import { getAvailableFiles } from './supabase';
 
 const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID!;
 const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN!;
-const AI_MODEL = '@cf/meta/llama-3.1-8b-instruct-awq';
+const AI_MODEL = process.env.CLOUDFLARE_AI_MODEL || '@cf/meta/llama-3.1-8b-instruct-fast';
 
 /**
  * We use Cloudflare Workers AI via REST API because Vercel Serverless
