@@ -11,6 +11,22 @@ export const dynamic = 'force-dynamic';
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 
+// In-memory cache for message deduplication (keeps last 1000 messages)
+const processedMessageIds = new Set<string>();
+const MAX_CACHE_SIZE = 1000;
+
+function isDuplicateMessage(messageId: string): boolean {
+  if (processedMessageIds.has(messageId)) {
+    return true;
+  }
+  processedMessageIds.add(messageId);
+  if (processedMessageIds.size > MAX_CACHE_SIZE) {
+    const oldestKey = processedMessageIds.values().next().value;
+    if (oldestKey) processedMessageIds.delete(oldestKey);
+  }
+  return false;
+}
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const mode = searchParams.get('hub.mode');
@@ -61,6 +77,13 @@ export async function POST(request: Request) {
       return new NextResponse('OK', { status: 200 });
     }
 
+    // Deduplication check
+    const messageId = message.id;
+    if (messageId && isDuplicateMessage(messageId)) {
+      console.log(`Duplicate message ignored: ${messageId}`);
+      return new NextResponse('OK', { status: 200 });
+    }
+
     const sender = message.from;
     const isSenderAdmin = await isAdmin(sender);
 
@@ -68,7 +91,6 @@ export async function POST(request: Request) {
     if (message.type === 'image' || message.type === 'video' || message.type === 'document') {
       const mediaId = message[message.type].id;
       const caption = message[message.type].caption || '';
-      const messageId = message.id; // WhatsApp Message ID
       
       try {
         await sendTextMessage(sender, "Downloading and saving your file...");
@@ -95,10 +117,11 @@ export async function POST(request: Request) {
           }
         }
         
-        const r2Key = `uploads/${Date.now()}_${filename}`;
+        // Store directly as uploads/filename in R2 so the key matches the filename
+        const r2Key = `uploads/${filename}`;
         
         await uploadFileToR2(r2Key, buffer, mimeType);
-        const savedFile = await saveFileMetadata(filename, r2Key, mimeType, sender, messageId);
+        const savedFile = await saveFileMetadata(filename, r2Key, mimeType, sender);
         
         let successMessage = `File successfully saved!\n\n` +
           `📂 Filename: ${filename}\n`;
