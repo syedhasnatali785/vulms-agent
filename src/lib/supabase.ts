@@ -203,9 +203,10 @@ export async function getFilesByKeywords(keywords: string[], contextTerms: strin
       .select('id, filename, r2_key, mime_type')
       .ilike('filename', `%${keyword}%`);
 
-    // Chain additional filters for context terms (acts as an AND filter)
-    for (const term of contextTerms) {
-      query = query.ilike('filename', `%${term}%`);
+    if (contextTerms.length > 0) {
+      // Build an OR filter string: filename.ilike.%term1%,filename.ilike.%term2%
+      const orFilter = contextTerms.map(term => `filename.ilike.%${term}%`).join(',');
+      query = query.or(orFilter);
     }
     return query;
   });
@@ -263,3 +264,32 @@ export async function getMessages(limit = 100) {
     return [];
   }
 }
+
+export async function saveLog(level: 'info' | 'warn' | 'error', message: string) {
+  try {
+    const { error } = await supabase
+      .from('logs')
+      .insert([{ level, message }]);
+    if (error) {
+      // Table might not exist, log to console
+      console.log(`[Supabase Log Fallback] [${level.toUpperCase()}] ${message}`);
+    }
+  } catch (err) {
+    console.log(`[Supabase Log Exception] [${level.toUpperCase()}] ${message}`);
+  }
+}
+
+export async function getLogsDb(limit = 100) {
+  try {
+    const { data, error } = await supabase
+      .from('logs')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    if (error) return [];
+    return data || [];
+  } catch (err) {
+    return [];
+  }
+}
+

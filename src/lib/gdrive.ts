@@ -144,26 +144,44 @@ export async function searchGDriveFiles(query: string, contextTerms: string[] = 
   console.log(`[GDrive] Search "${query}" [${contextTerms}] → ${relevantFolders.length}/${allFolders.length} folders`);
 
   const escapedQuery = query.replace(/'/g, "\\'");
-  const contextFilters = contextTerms.map(t => `and name contains '${t.replace(/'/g, "\\'")}'`).join(' ');
+  
+  // Build the context term filters for the query string using OR grouping
+  // Example: and (name contains 'finale' or name contains 'final')
+  let contextFilters = '';
+  if (contextTerms.length > 0) {
+    const inner = contextTerms.map(term => `name contains '${term.replace(/'/g, "\\'")}'`).join(' or ');
+    contextFilters = `and (${inner})`;
+  }
+
   const results: GDriveFile[] = [];
 
+  // Query each folder individually (chunkSize=1) with concurrency limit of 10
   const CONCURRENCY = 10;
   for (let i = 0; i < relevantFolders.length; i += CONCURRENCY) {
     const batch = relevantFolders.slice(i, i + CONCURRENCY);
     const promises = batch.map(async (folder) => {
       try {
         const q = `'${folder.id}' in parents and name contains '${escapedQuery}' ${contextFilters} and trashed = false`;
-        const res = await axios.get('https://www.googleapis.com/drive/v3/files', {
-          params: { q, key: GOOGLE_API_KEY, fields: 'files(id, name, mimeType)', pageSize: 20 }
+        const response = await axios.get('https://www.googleapis.com/drive/v3/files', {
+          params: {
+            q,
+            key: GOOGLE_API_KEY,
+            fields: 'files(id, name, mimeType)',
+            pageSize: 20
+          }
         });
-        return res.data?.files || [];
-      } catch { return []; }
+        return response.data?.files || [];
+      } catch (error: any) {
+        // Silently skip folders that throw 403 (private shortcuts)
+        return [];
+      }
     });
-    const batchResults = await Promise.all(promises);
-    for (const files of batchResults) results.push(...files);
-  }
 
-  const seen = new Set<string>();
+    const batchResults = await Promise.all(promises);
+    for (const files of batchResults) {
+      results.push(...files);
+    }
+  } const seen = new Set<string>();
   return results.filter(f => { if (seen.has(f.id)) return false; seen.add(f.id); return true; });
 }
 

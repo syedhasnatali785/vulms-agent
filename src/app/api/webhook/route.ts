@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractCourseKeywords, getFilesByKeywords, saveMessage } from '@/lib/supabase';
+import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractCourseKeywords, getFilesByKeywords, saveMessage, saveLog } from '@/lib/supabase';
 import { downloadWhatsAppMedia, sendTextMessage, sendMediaMessage } from '@/lib/whatsapp';
 import { uploadFileToR2, getFileUrl } from '@/lib/r2';
 import { processUserIntent } from '@/lib/ai';
@@ -36,6 +36,9 @@ const MAX_LOGS = 200;
 function addLog(level: 'info' | 'warn' | 'error', message: string) {
   logsBuffer.unshift({ timestamp: new Date().toISOString(), level, message });
   if (logsBuffer.length > MAX_LOGS) logsBuffer.pop();
+  
+  // Log asynchronously to Supabase logs table (non-blocking)
+  saveLog(level, message).catch(() => {});
 }
 
 export function getLogs(): LogEntry[] {
@@ -67,20 +70,42 @@ function isConversationalQuery(text: string): boolean {
  */
 function extractSmartSearchParams(text: string): { courseCode: string | null; contextTerms: string[] } {
   const lowerText = text.toLowerCase();
-  const terms: string[] = [];
-
+  
   // Extract course code (letters + digits pattern like cs405, eng201)
   const codeMatch = lowerText.match(/\b([a-z]{2,5})\s*[-_]?\s*(\d{2,4})\b/);
   const courseCode = codeMatch ? `${codeMatch[1]}${codeMatch[2]}` : null;
+  
+  const terms: string[] = [];
 
-  // Extract context terms using CONTAINS (not strict word boundary)
-  // This catches "finale", "finals", "finalterm", "final" etc.
-  if (lowerText.includes('highlight')) terms.push('highlight');
-  if (lowerText.includes('handout')) terms.push('handout');
-  if (lowerText.includes('mid') && !lowerText.includes('midnight')) terms.push('mid');
-  if (lowerText.includes('final')) terms.push('final');
+  if (courseCode) {
+    // Split message into words using standard separators
+    const words = lowerText.split(/[\s,._-]+/);
+    for (const word of words) {
+      if (word.includes('final') || word.includes('mid') || word.includes('handout') || word.includes('highlight')) {
+        // Add the exact word typed by the user (e.g., 'finale', 'mids')
+        terms.push(word);
+        
+        // Also add standard normalized root terms to maximize hits
+        if (word.includes('final') && word !== 'final') {
+          terms.push('final');
+        }
+        if (word.includes('mid') && word !== 'mid' && word !== 'midterm') {
+          terms.push('mid');
+          terms.push('midterm');
+        }
+        if (word.includes('handout') && word !== 'handout') {
+          terms.push('handout');
+        }
+        if (word.includes('highlight') && word !== 'highlight') {
+          terms.push('highlight');
+        }
+      }
+    }
+  }
 
-  return { courseCode, contextTerms: terms };
+  // Deduplicate matched terms
+  const uniqueTerms = Array.from(new Set(terms));
+  return { courseCode, contextTerms: uniqueTerms };
 }
 
 /** Helper: sends a text message and logs it to Supabase + in-memory logs */
