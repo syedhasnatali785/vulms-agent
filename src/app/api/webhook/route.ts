@@ -27,6 +27,76 @@ function isDuplicateMessage(messageId: string): boolean {
   return false;
 }
 
+// Set of conversational greeting words/short replies
+const CONVERSATIONAL_WORDS = new Set([
+  'hi', 'hello', 'hey', 'yo', 'hola', 'hlo', 'hy', 'assalam', 'o', 'alaikum', 'aoa', 'ws', 'salam',
+  'ok', 'okay', 'yes', 'no', 'yep', 'nope', 'g', 'ji', 'haan', 'fine',
+  'thanks', 'thank', 'thankyou', 'welcome',
+  'please', 'pls', 'help', 'info', 'test', 'status',
+  'admin', 'agent', 'bot', 'good', 'morning', 'afternoon', 'evening'
+]);
+
+/**
+ * Checks if the user text is a greeting or standard conversational word to prevent false-positive file delivery
+ */
+function isConversationalQuery(text: string): boolean {
+  const clean = text.toLowerCase().trim().replace(/[?.!,]/g, '');
+  if (!clean) return true;
+  if (CONVERSATIONAL_WORDS.has(clean)) return true;
+  
+  const words = clean.split(/\s+/);
+  return words.every(w => CONVERSATIONAL_WORDS.has(w));
+}
+
+/**
+ * Filters a list of files based on keywords inside the user's message (e.g. handouts, highlighted, mids, finals)
+ */
+function filterFilesByContext(files: any[], text: string): any[] {
+  const lowerText = text.toLowerCase();
+  
+  const wantsHighlighted = lowerText.includes('highlight');
+  const wantsHandouts = lowerText.includes('handout');
+  const wantsMids = /\b(mid|mids|midterm|mid-term)\b/i.test(lowerText);
+  const wantsFinals = /\b(final|finals|finalterm|final-term)\b/i.test(lowerText);
+
+  // If no specific category is mentioned in the query, return all matching files
+  if (!wantsHighlighted && !wantsHandouts && !wantsMids && !wantsFinals) {
+    return files;
+  }
+  
+  let filtered = [...files];
+
+  if (wantsHighlighted) {
+    filtered = filtered.filter(f => {
+      const name = (f.filename || f.name || '').toLowerCase();
+      return name.includes('highlight');
+    });
+  }
+
+  if (wantsHandouts) {
+    filtered = filtered.filter(f => {
+      const name = (f.filename || f.name || '').toLowerCase();
+      return name.includes('handout');
+    });
+  }
+
+  if (wantsMids) {
+    filtered = filtered.filter(f => {
+      const name = (f.filename || f.name || '').toLowerCase();
+      return name.includes('mid') || name.includes('mids') || name.includes('midterm');
+    });
+  }
+
+  if (wantsFinals) {
+    filtered = filtered.filter(f => {
+      const name = (f.filename || f.name || '').toLowerCase();
+      return name.includes('final') || name.includes('finals') || name.includes('finalterm');
+    });
+  }
+
+  return filtered;
+}
+
 /** Helper: sends a text message and logs it to Supabase */
 async function sendAndLogTextMessage(to: string, text: string) {
   await sendTextMessage(to, text);
@@ -161,15 +231,19 @@ export async function POST(request: Request) {
         // 2. Try Google Drive (directly query and send download url)
         const driveFiles = await searchGDriveFiles(query);
         if (driveFiles.length > 0) {
-          const driveFile = driveFiles[0];
-          try {
-            await sendAndLogTextMessage(sender, `Here is your file: ${driveFile.name}`);
-            await sendGDriveFileToUser(sender, driveFile);
-          } catch (err) {
-            console.error("Error sending Google Drive file:", err);
-            await sendAndLogTextMessage(sender, "Sorry, I found the file on Google Drive but failed to send it.");
+          // If query has course parameters, apply filters
+          const filteredDrive = filterFilesByContext(driveFiles, query);
+          if (filteredDrive.length > 0) {
+            const driveFile = filteredDrive[0];
+            try {
+              await sendAndLogTextMessage(sender, `Here is your file: ${driveFile.name}`);
+              await sendGDriveFileToUser(sender, driveFile);
+            } catch (err) {
+              console.error("Error sending Google Drive file:", err);
+              await sendAndLogTextMessage(sender, "Sorry, I found the file on Google Drive but failed to send it.");
+            }
+            return new NextResponse('OK', { status: 200 });
           }
-          return new NextResponse('OK', { status: 200 });
         }
 
         await sendAndLogTextMessage(sender, `Sorry, I couldn't find any file matching "${query}".`);
@@ -179,7 +253,7 @@ export async function POST(request: Request) {
       // ── Step 2b: Course code keyword matching (e.g. "eng201", "send me CS 101 notes") ──
       const courseKeywords = extractCourseKeywords(text);
       if (courseKeywords.length > 0) {
-        const matchingDbFiles = await getFilesByKeywords(courseKeywords);
+        let matchingDbFiles = await getFilesByKeywords(courseKeywords);
         
         // Query Google Drive matching files in real-time
         const matchingDriveFiles: any[] = [];
@@ -196,12 +270,16 @@ export async function POST(request: Request) {
           return true;
         });
 
-        const totalFilesCount = matchingDbFiles.length + uniqueDriveFiles.length;
+        // Apply keyword context filtering (handouts, highlighted, mids, finals)
+        const filteredDbFiles = filterFilesByContext(matchingDbFiles, text);
+        const filteredDriveFiles = filterFilesByContext(uniqueDriveFiles, text);
+
+        const totalFilesCount = filteredDbFiles.length + filteredDriveFiles.length;
         if (totalFilesCount > 0) {
           await sendAndLogTextMessage(sender, `Found ${totalFilesCount} file(s) matching your request:`);
           
           // Send Supabase files
-          for (const file of matchingDbFiles) {
+          for (const file of filteredDbFiles) {
             try {
               await sendFileToUser(sender, file);
             } catch (err) {
@@ -210,7 +288,7 @@ export async function POST(request: Request) {
           }
 
           // Send Google Drive files directly (no downloading/uploading)
-          for (const file of uniqueDriveFiles) {
+          for (const file of filteredDriveFiles) {
             try {
               await sendGDriveFileToUser(sender, file);
             } catch (err) {
@@ -219,36 +297,43 @@ export async function POST(request: Request) {
           }
           return new NextResponse('OK', { status: 200 });
         }
-        
-        await sendAndLogTextMessage(sender, `No files found for course code "${courseKeywords[0]}". Files may not have been uploaded yet.`);
+        // Course code detected but no files matched filters
+        await sendAndLogTextMessage(sender, `No matching files found for course code and keyword filters in "${text}".`);
         return new NextResponse('OK', { status: 200 });
       }
 
       // ── Step 2c: Short direct input (filename, file ID, message ID) ──
+      // Bypasses if message is a conversational greeting/short response (like "Hi", "Hello")
       const wordCount = text.split(/\s+/).length;
-      if (wordCount <= 4) {
+      if (wordCount <= 4 && !isConversationalQuery(text)) {
         // 1. Try Supabase
         const dbFile = await getFileByIdOrNameOrMessageId(text);
         if (dbFile) {
-          try {
-            await sendAndLogTextMessage(sender, `Found matching file: ${dbFile.filename}`);
-            await sendFileToUser(sender, dbFile);
-            return new NextResponse('OK', { status: 200 });
-          } catch (err) {
-            console.error(`Error sending direct DB file:`, err);
+          const filtered = filterFilesByContext([dbFile], text);
+          if (filtered.length > 0) {
+            try {
+              await sendAndLogTextMessage(sender, `Found matching file: ${dbFile.filename}`);
+              await sendFileToUser(sender, dbFile);
+              return new NextResponse('OK', { status: 200 });
+            } catch (err) {
+              console.error(`Error sending direct DB file:`, err);
+            }
           }
         }
 
         // 2. Try Google Drive
         const driveFiles = await searchGDriveFiles(text);
         if (driveFiles.length > 0) {
-          const driveFile = driveFiles[0];
-          try {
-            await sendAndLogTextMessage(sender, `Found matching Google Drive file: ${driveFile.name}`);
-            await sendGDriveFileToUser(sender, driveFile);
-            return new NextResponse('OK', { status: 200 });
-          } catch (err) {
-            console.error(`Error sending direct Drive file:`, err);
+          const filtered = filterFilesByContext(driveFiles, text);
+          if (filtered.length > 0) {
+            const driveFile = filtered[0];
+            try {
+              await sendAndLogTextMessage(sender, `Found matching Google Drive file: ${driveFile.name}`);
+              await sendGDriveFileToUser(sender, driveFile);
+              return new NextResponse('OK', { status: 200 });
+            } catch (err) {
+              console.error(`Error sending direct Drive file:`, err);
+            }
           }
         }
       }
@@ -282,17 +367,25 @@ export async function POST(request: Request) {
               // 1. Try Supabase first
               const dbFile = await getFileByIdOrNameOrMessageId(intent.filename);
               if (dbFile) {
-                await sendAndLogTextMessage(sender, intent.reply || "Here is the file you requested.");
-                await sendFileToUser(sender, dbFile);
-                break;
+                const filtered = filterFilesByContext([dbFile], text);
+                if (filtered.length > 0) {
+                  await sendAndLogTextMessage(sender, intent.reply || "Here is the file you requested.");
+                  await sendFileToUser(sender, dbFile);
+                  break;
+                }
               }
 
               // 2. Try Google Drive (directly query and send download url)
               const driveFiles = await searchGDriveFiles(intent.filename);
               if (driveFiles.length > 0) {
-                const driveFile = driveFiles[0];
-                await sendAndLogTextMessage(sender, intent.reply || "Here is the file you requested.");
-                await sendGDriveFileToUser(sender, driveFile);
+                const filtered = filterFilesByContext(driveFiles, text);
+                if (filtered.length > 0) {
+                  const driveFile = filtered[0];
+                  await sendAndLogTextMessage(sender, intent.reply || "Here is the file you requested.");
+                  await sendGDriveFileToUser(sender, driveFile);
+                } else {
+                  await sendAndLogTextMessage(sender, `Sorry, no handouts/files matched your request details.`);
+                }
               } else {
                 await sendAndLogTextMessage(sender, `Sorry, I couldn't find a file named "${intent.filename}".`);
               }
