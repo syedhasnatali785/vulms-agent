@@ -5,29 +5,44 @@ import { uploadFileToR2, getFileUrl } from '@/lib/r2';
 import { processUserIntent } from '@/lib/ai';
 import { searchGDriveFiles } from '@/lib/gdrive';
 
-// Vercel serverless function max duration (Hobby plan is restricted to 10s anyway, but this is good practice if upgraded)
 export const maxDuration = 10;
 export const dynamic = 'force-dynamic';
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 
-// In-memory cache for message deduplication (keeps last 1000 messages)
+// In-memory deduplication cache
 const processedMessageIds = new Set<string>();
 const MAX_CACHE_SIZE = 1000;
 
 function isDuplicateMessage(messageId: string): boolean {
-  if (processedMessageIds.has(messageId)) {
-    return true;
-  }
+  if (processedMessageIds.has(messageId)) return true;
   processedMessageIds.add(messageId);
   if (processedMessageIds.size > MAX_CACHE_SIZE) {
-    const oldestKey = processedMessageIds.values().next().value;
-    if (oldestKey) processedMessageIds.delete(oldestKey);
+    const oldest = processedMessageIds.values().next().value;
+    if (oldest) processedMessageIds.delete(oldest);
   }
   return false;
 }
 
-// Set of conversational greeting words/short replies
+// In-memory logs buffer for dashboard
+interface LogEntry {
+  timestamp: string;
+  level: 'info' | 'warn' | 'error';
+  message: string;
+}
+const logsBuffer: LogEntry[] = [];
+const MAX_LOGS = 200;
+
+function addLog(level: 'info' | 'warn' | 'error', message: string) {
+  logsBuffer.unshift({ timestamp: new Date().toISOString(), level, message });
+  if (logsBuffer.length > MAX_LOGS) logsBuffer.pop();
+}
+
+export function getLogs(): LogEntry[] {
+  return logsBuffer;
+}
+
+// Conversational stop-words
 const CONVERSATIONAL_WORDS = new Set([
   'hi', 'hello', 'hey', 'yo', 'hola', 'hlo', 'hy', 'assalam', 'o', 'alaikum', 'aoa', 'ws', 'salam',
   'ok', 'okay', 'yes', 'no', 'yep', 'nope', 'g', 'ji', 'haan', 'fine',
@@ -36,112 +51,61 @@ const CONVERSATIONAL_WORDS = new Set([
   'admin', 'agent', 'bot', 'good', 'morning', 'afternoon', 'evening'
 ]);
 
-/**
- * Checks if the user text is a greeting or standard conversational word to prevent false-positive file delivery
- */
 function isConversationalQuery(text: string): boolean {
   const clean = text.toLowerCase().trim().replace(/[?.!,]/g, '');
   if (!clean) return true;
   if (CONVERSATIONAL_WORDS.has(clean)) return true;
-  
-  const words = clean.split(/\s+/);
-  return words.every(w => CONVERSATIONAL_WORDS.has(w));
+  return clean.split(/\s+/).every(w => CONVERSATIONAL_WORDS.has(w));
 }
 
 /**
- * Parses user prompt to find content-type context constraints (handouts, highlighted, mids, finals)
+ * SMART keyword extraction: extracts subject code + context terms from user message.
+ * Example: "cs405 finale term files send kar do"
+ *   → courseCode: "cs405"
+ *   → contextTerms: ["final"] (normalized from "finale")
+ *   → Drive search: name contains 'cs405' AND name contains 'final'
  */
-function getSearchContextTerms(text: string): string[] {
+function extractSmartSearchParams(text: string): { courseCode: string | null; contextTerms: string[] } {
   const lowerText = text.toLowerCase();
   const terms: string[] = [];
 
-  if (lowerText.includes('highlight')) {
-    terms.push('highlight');
-  }
-  if (lowerText.includes('handout')) {
-    terms.push('handout');
-  }
-  if (/\b(mid|mids|midterm|mid-term)\b/i.test(lowerText)) {
-    terms.push('mid');
-  }
-  if (/\b(final|finals|finalterm|final-term)\b/i.test(lowerText)) {
-    terms.push('final');
-  }
+  // Extract course code (letters + digits pattern like cs405, eng201)
+  const codeMatch = lowerText.match(/\b([a-z]{2,5})\s*[-_]?\s*(\d{2,4})\b/);
+  const courseCode = codeMatch ? `${codeMatch[1]}${codeMatch[2]}` : null;
 
-  return terms;
+  // Extract context terms using CONTAINS (not strict word boundary)
+  // This catches "finale", "finals", "finalterm", "final" etc.
+  if (lowerText.includes('highlight')) terms.push('highlight');
+  if (lowerText.includes('handout')) terms.push('handout');
+  if (lowerText.includes('mid') && !lowerText.includes('midnight')) terms.push('mid');
+  if (lowerText.includes('final')) terms.push('final');
+
+  return { courseCode, contextTerms: terms };
 }
 
-/**
- * Filters a list of files based on keywords inside the user's message (e.g. handouts, highlighted, mids, finals)
- */
-function filterFilesByContext(files: any[], text: string): any[] {
-  const lowerText = text.toLowerCase();
-  
-  const wantsHighlighted = lowerText.includes('highlight');
-  const wantsHandouts = lowerText.includes('handout');
-  const wantsMids = /\b(mid|mids|midterm|mid-term)\b/i.test(lowerText);
-  const wantsFinals = /\b(final|finals|finalterm|final-term)\b/i.test(lowerText);
-
-  // If no specific category is mentioned in the query, return all matching files
-  if (!wantsHighlighted && !wantsHandouts && !wantsMids && !wantsFinals) {
-    return files;
-  }
-  
-  let filtered = [...files];
-
-  if (wantsHighlighted) {
-    filtered = filtered.filter(f => {
-      const name = (f.filename || f.name || '').toLowerCase();
-      return name.includes('highlight');
-    });
-  }
-
-  if (wantsHandouts) {
-    filtered = filtered.filter(f => {
-      const name = (f.filename || f.name || '').toLowerCase();
-      return name.includes('handout');
-    });
-  }
-
-  if (wantsMids) {
-    filtered = filtered.filter(f => {
-      const name = (f.filename || f.name || '').toLowerCase();
-      return name.includes('mid') || name.includes('mids') || name.includes('midterm');
-    });
-  }
-
-  if (wantsFinals) {
-    filtered = filtered.filter(f => {
-      const name = (f.filename || f.name || '').toLowerCase();
-      return name.includes('final') || name.includes('finals') || name.includes('finalterm');
-    });
-  }
-
-  return filtered;
-}
-
-/** Helper: sends a text message and logs it to Supabase */
+/** Helper: sends a text message and logs it to Supabase + in-memory logs */
 async function sendAndLogTextMessage(to: string, text: string) {
   await sendTextMessage(to, text);
   await saveMessage(to, text, 'outgoing');
+  addLog('info', `→ Bot to ${to}: ${text.substring(0, 100)}`);
 }
 
-/** Helper: resolve a local file record to a media message sent to the user */
 async function sendFileToUser(sender: string, file: any) {
   const fileUrl = await getFileUrl(file.r2_key);
   const mediaType = file.mime_type.startsWith('image') ? 'image'
                    : file.mime_type.startsWith('video') ? 'video'
                    : 'document' as const;
   await sendMediaMessage(sender, mediaType, fileUrl, file.filename);
+  addLog('info', `→ Sent file "${file.filename}" to ${sender}`);
 }
 
-/** Helper: sends a Google Drive file directly as a media payload to WhatsApp without downloading it locally */
 async function sendGDriveFileToUser(sender: string, file: any) {
   const fileUrl = `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media&key=${process.env.GOOGLE_API_KEY}`;
   const mediaType = file.mimeType.startsWith('image') ? 'image'
                    : file.mimeType.startsWith('video') ? 'video'
                    : 'document' as const;
   await sendMediaMessage(sender, mediaType, fileUrl, file.name);
+  addLog('info', `→ Sent GDrive file "${file.name}" to ${sender}`);
 }
 
 export async function GET(request: Request) {
@@ -153,15 +117,12 @@ export async function GET(request: Request) {
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
     return new NextResponse(challenge, { status: 200 });
   }
-
   return new NextResponse('Forbidden', { status: 403 });
 }
 
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-
-    // Check if it's a WhatsApp status update or actual message
     if (body.object !== 'whatsapp_business_account') {
       return new NextResponse('Not a WhatsApp event', { status: 404 });
     }
@@ -170,49 +131,41 @@ export async function POST(request: Request) {
     const changes = entry?.changes?.[0];
     const value = changes?.value;
     const messages = value?.messages || [];
-    
-    // Acknowledge immediately if there are no messages
+
     if (messages.length === 0) {
       return new NextResponse('OK', { status: 200 });
     }
 
-    // Process all messages in the batch concurrently in parallel
+    // Process all messages concurrently
     const processPromises = messages.map(async (message: any) => {
-      // Deduplication check per message
       const messageId = message.id;
-      if (messageId && isDuplicateMessage(messageId)) {
-        console.log(`Duplicate message ignored: ${messageId}`);
-        return;
-      }
+      if (messageId && isDuplicateMessage(messageId)) return;
 
       const sender = message.from;
+      addLog('info', `← Message from ${sender}: type=${message.type}`);
+
       const isSenderAdmin = await isAdmin(sender);
+      const MEDIA_TYPES = ['image', 'video', 'document', 'audio', 'voice', 'sticker'];
 
-      // Supported WhatsApp media types
-      const SUPPORTED_MEDIA_TYPES = ['image', 'video', 'document', 'audio', 'voice', 'sticker'];
-
-      // 1. Handle File Uploads (Media)
-      if (SUPPORTED_MEDIA_TYPES.includes(message.type)) {
+      // 1. Handle Media Uploads
+      if (MEDIA_TYPES.includes(message.type)) {
         const mediaId = message[message.type]?.id;
         const caption = message[message.type]?.caption || '';
-        
+
         if (mediaId) {
           try {
             await sendAndLogTextMessage(sender, `Downloading and saving your ${message.type}...`);
             const { buffer, mimeType } = await downloadWhatsAppMedia(mediaId);
-            
-            // Generate a filename or use original filename/caption
+
             let rawFilename = '';
             if (message.type === 'document' && message.document?.filename) {
               rawFilename = message.document.filename;
             } else {
               rawFilename = caption || `file_${Date.now()}`;
             }
-            
+
             const ext = mimeType.split('/')[1] || 'bin';
             const safeExt = ext.split(';')[0] || 'bin';
-            
-            // Ensure the filename has the correct extension if not already present
             let filename = rawFilename.replace(/\s+/g, '_');
             if (!filename.toLowerCase().endsWith(`.${safeExt.toLowerCase()}`)) {
               if (mimeType === 'application/pdf' && !filename.toLowerCase().endsWith('.pdf')) {
@@ -221,36 +174,21 @@ export async function POST(request: Request) {
                 filename = `${filename}.${safeExt}`;
               }
             }
-            
-            // Store directly as uploads/filename in R2 so the key matches the filename
+
             const r2Key = `uploads/${filename}`;
-            
             await uploadFileToR2(r2Key, buffer, mimeType);
             const savedFile = await saveFileMetadata(filename, r2Key, mimeType, sender);
-            
-            let successMessage = `File successfully saved!\n\n` +
-              `📂 Filename: ${filename}\n`;
-            
-            if (savedFile) {
-              successMessage += `🆔 File ID: ${savedFile.id}\n`;
-            }
-            successMessage += `✉️ Message ID: ${messageId}\n\n` +
-              `You can retrieve this file anytime by typing its name or course code (e.g. "eng201").`;
-            
-            await sendAndLogTextMessage(sender, successMessage);
+
+            let msg = `File saved! 📂 ${filename}`;
+            if (savedFile) msg += ` (ID: ${savedFile.id})`;
+            await sendAndLogTextMessage(sender, msg);
           } catch (e: any) {
-            console.error("Upload Error:", e);
-            await sendAndLogTextMessage(sender, "Failed to process the upload. Make sure the file is supported.");
+            addLog('error', `Upload failed for ${sender}: ${e.message}`);
+            await sendAndLogTextMessage(sender, "Failed to process the upload.");
           }
         }
-        
-        // If there is no caption accompanied, we stop here.
-        // Otherwise, we overwrite the message type to 'text' and body to caption 
-        // to let the AI process it.
-        if (!caption.trim()) {
-          return;
-        }
-        
+
+        if (!caption.trim()) return;
         message.type = 'text';
         message.text = { body: caption.trim() };
       }
@@ -258,200 +196,115 @@ export async function POST(request: Request) {
       // 2. Handle Text Messages
       if (message.type === 'text') {
         const text = message.text.body.trim();
-
-        // Log incoming text message to Supabase
         await saveMessage(sender, text, 'incoming');
+        addLog('info', `← ${sender}: "${text}"`);
 
-        // ── Step 2a: Explicit "retrieve/get/download <query>" commands ──
-        const retrieveMatch = text.match(/^(?:retrieve|get|download)\s+(.+)$/i);
-        if (retrieveMatch) {
-          const query = retrieveMatch[1].trim();
-          const contextTerms = getSearchContextTerms(text);
-          
-          // 1. Try Supabase first
-          const dbFile = await getFileByIdOrNameOrMessageId(query);
-          if (dbFile) {
+        // Skip greetings
+        if (isConversationalQuery(text)) {
+          addLog('info', `Greeting detected, skipping file search for "${text}"`);
+          // Fall through to AI
+        } else {
+          // Smart extraction: "cs405 finale term files send kar do" → code=cs405, context=[final]
+          const { courseCode, contextTerms } = extractSmartSearchParams(text);
+          addLog('info', `Extracted: code=${courseCode}, context=[${contextTerms}]`);
+
+          if (courseCode) {
             try {
-              await sendAndLogTextMessage(sender, `Here is your file: ${dbFile.filename}`);
-              await sendFileToUser(sender, dbFile);
-            } catch (err) {
-              console.error("Error sending retrieved file:", err);
-              await sendAndLogTextMessage(sender, "Sorry, I found the file but failed to retrieve it from storage.");
-            }
-            return;
-          }
+              // Search Supabase
+              const dbFiles = await getFilesByKeywords([courseCode], contextTerms);
+              addLog('info', `Supabase: ${dbFiles.length} files for "${courseCode}"`);
 
-          // 2. Try Google Drive (directly query and send download url)
-          const driveFiles = await searchGDriveFiles(query, contextTerms);
-          if (driveFiles.length > 0) {
-            const filteredDrive = filterFilesByContext(driveFiles, text);
-            if (filteredDrive.length > 0) {
-              const driveFile = filteredDrive[0];
-              try {
-                await sendAndLogTextMessage(sender, `Here is your file: ${driveFile.name}`);
-                await sendGDriveFileToUser(sender, driveFile);
-              } catch (err) {
-                console.error("Error sending Google Drive file:", err);
-                await sendAndLogTextMessage(sender, "Sorry, I found the file on Google Drive but failed to send it.");
+              // Search Google Drive
+              const driveFiles = await searchGDriveFiles(courseCode, contextTerms);
+              addLog('info', `GDrive: ${driveFiles.length} files for "${courseCode}"`);
+
+              const totalCount = dbFiles.length + driveFiles.length;
+              if (totalCount > 0) {
+                await sendAndLogTextMessage(sender, `Found ${totalCount} file(s) matching "${courseCode}" ${contextTerms.length > 0 ? `(${contextTerms.join(', ')})` : ''}:`);
+
+                for (const file of dbFiles) {
+                  try { await sendFileToUser(sender, file); } catch (err: any) {
+                    addLog('error', `Failed sending DB file: ${err.message}`);
+                  }
+                }
+                for (const file of driveFiles) {
+                  try { await sendGDriveFileToUser(sender, file); } catch (err: any) {
+                    addLog('error', `Failed sending GDrive file: ${err.message}`);
+                  }
+                }
+                return;
               }
-              return;
+
+              addLog('warn', `No files found for "${courseCode}" [${contextTerms}]. Falling through to AI.`);
+            } catch (err: any) {
+              addLog('error', `Search error: ${err.message}`);
             }
           }
 
-          await sendAndLogTextMessage(sender, `Sorry, I couldn't find any file matching "${query}".`);
-          return;
-        }
-
-        // ── Step 2b: Course code keyword matching (e.g. "eng201", "send me CS 101 notes") ──
-        const courseKeywords = extractCourseKeywords(text);
-        if (courseKeywords.length > 0) {
-          const contextTerms = getSearchContextTerms(text);
-          let matchingDbFiles = await getFilesByKeywords(courseKeywords, contextTerms);
-          
-          // Query Google Drive matching files in real-time
-          const matchingDriveFiles: any[] = [];
-          for (const kw of courseKeywords) {
-            const driveFiles = await searchGDriveFiles(kw, contextTerms);
-            matchingDriveFiles.push(...driveFiles);
-          }
-          
-          // Deduplicate drive files by ID
-          const seenDriveIds = new Set<string>();
-          const uniqueDriveFiles = matchingDriveFiles.filter(f => {
-            if (seenDriveIds.has(f.id)) return false;
-            seenDriveIds.add(f.id);
-            return true;
-          });
-
-          // Apply keyword context filtering (handouts, highlighted, mids, finals)
-          const filteredDbFiles = filterFilesByContext(matchingDbFiles, text);
-          const filteredDriveFiles = filterFilesByContext(uniqueDriveFiles, text);
-
-          const totalFilesCount = filteredDbFiles.length + filteredDriveFiles.length;
-          if (totalFilesCount > 0) {
-            await sendAndLogTextMessage(sender, `Found ${totalFilesCount} file(s) matching your request:`);
-            
-            // Send Supabase files
-            for (const file of filteredDbFiles) {
+          // Short direct input check (filename, file ID)
+          const wordCount = text.split(/\s+/).length;
+          if (wordCount <= 4 && !isConversationalQuery(text)) {
+            const dbFile = await getFileByIdOrNameOrMessageId(text);
+            if (dbFile) {
               try {
-                await sendFileToUser(sender, file);
-              } catch (err) {
-                console.error(`Error sending DB file ${file.filename}:`, err);
-              }
-            }
-
-            // Send Google Drive files directly (no downloading/uploading)
-            for (const file of filteredDriveFiles) {
-              try {
-                await sendGDriveFileToUser(sender, file);
-              } catch (err) {
-                console.error(`Error sending Google Drive file ${file.name}:`, err);
-              }
-            }
-            return;
-          }
-          // Course code detected but no files matched filters -> let it fall through to the LLM
-          console.log(`Course keyword match returned 0 files for "${text}". Handing over to Cloudflare AI Workers...`);
-        }
-
-        // ── Step 2c: Short direct input (filename, file ID, message ID) ──
-        // Bypasses if message is a conversational greeting/short response (like "Hi", "Hello")
-        const wordCount = text.split(/\s+/).length;
-        if (wordCount <= 4 && !isConversationalQuery(text)) {
-          const contextTerms = getSearchContextTerms(text);
-
-          // 1. Try Supabase
-          const dbFile = await getFileByIdOrNameOrMessageId(text);
-          if (dbFile) {
-            const filtered = filterFilesByContext([dbFile], text);
-            if (filtered.length > 0) {
-              try {
-                await sendAndLogTextMessage(sender, `Found matching file: ${dbFile.filename}`);
+                await sendAndLogTextMessage(sender, `Found file: ${dbFile.filename}`);
                 await sendFileToUser(sender, dbFile);
                 return;
-              } catch (err) {
-                console.error(`Error sending direct DB file:`, err);
+              } catch (err: any) {
+                addLog('error', `Direct file send error: ${err.message}`);
               }
             }
-          }
 
-          // 2. Try Google Drive
-          const driveFiles = await searchGDriveFiles(text, contextTerms);
-          if (driveFiles.length > 0) {
-            const filtered = filterFilesByContext(driveFiles, text);
-            if (filtered.length > 0) {
-              const driveFile = filtered[0];
+            const driveFiles = await searchGDriveFiles(text);
+            if (driveFiles.length > 0) {
               try {
-                await sendAndLogTextMessage(sender, `Found matching Google Drive file: ${driveFile.name}`);
-                await sendGDriveFileToUser(sender, driveFile);
+                await sendAndLogTextMessage(sender, `Found: ${driveFiles[0].name}`);
+                await sendGDriveFileToUser(sender, driveFiles[0]);
                 return;
-              } catch (err) {
-                console.error(`Error sending direct Drive file:`, err);
+              } catch (err: any) {
+                addLog('error', `Direct GDrive send error: ${err.message}`);
               }
             }
           }
         }
 
-        // ── Step 2d: AI intent resolution (conversational messages, complex requests) ──
+        // AI fallback
         let intent;
         try {
           intent = await processUserIntent(text, isSenderAdmin);
-        } catch (aiErr) {
-          console.error("AI processing error:", aiErr);
-          intent = {
-            type: 'chat',
-            reply: "I'm here to help! You can:\n• Upload files by sending them directly\n• Retrieve files by name or course code (e.g. \"eng201\")\n• Use \"retrieve <filename>\" for specific files"
-          };
+          addLog('info', `AI intent: ${intent.type}`);
+        } catch (aiErr: any) {
+          addLog('error', `AI error: ${aiErr.message}`);
+          intent = { type: 'chat', reply: "I'm here to help! Send a course code like 'cs405 final' to get files." };
         }
-        
+
         switch (intent.type) {
           case 'add_admin':
             if (isSenderAdmin && intent.newNumber) {
               const success = await addAdmin(intent.newNumber, sender);
-              const msg = success ? `Successfully added ${intent.newNumber} as admin.` : "Failed to add admin.";
-              await sendAndLogTextMessage(sender, intent.reply || msg);
+              await sendAndLogTextMessage(sender, success ? `Added ${intent.newNumber} as admin.` : "Failed to add admin.");
             } else {
-              await sendAndLogTextMessage(sender, "Only existing admins can add new admins.");
+              await sendAndLogTextMessage(sender, "Only admins can add new admins.");
             }
             break;
-
           case 'send_file':
             if (intent.filename) {
-              try {
-                const contextTerms = getSearchContextTerms(text);
-
-                // 1. Try Supabase first
-                const dbFile = await getFileByIdOrNameOrMessageId(intent.filename);
-                if (dbFile) {
-                  const filtered = filterFilesByContext([dbFile], text);
-                  if (filtered.length > 0) {
-                    await sendAndLogTextMessage(sender, intent.reply || "Here is the file you requested.");
-                    await sendFileToUser(sender, dbFile);
-                    break;
-                  }
-                }
-
-                // 2. Try Google Drive (directly query and send download url)
+              const { contextTerms } = extractSmartSearchParams(text);
+              const dbFile = await getFileByIdOrNameOrMessageId(intent.filename);
+              if (dbFile) {
+                await sendAndLogTextMessage(sender, intent.reply || "Here is your file.");
+                await sendFileToUser(sender, dbFile);
+              } else {
                 const driveFiles = await searchGDriveFiles(intent.filename, contextTerms);
                 if (driveFiles.length > 0) {
-                  const filtered = filterFilesByContext(driveFiles, text);
-                  if (filtered.length > 0) {
-                    const driveFile = filtered[0];
-                    await sendAndLogTextMessage(sender, intent.reply || "Here is the file you requested.");
-                    await sendGDriveFileToUser(sender, driveFile);
-                  } else {
-                    await sendAndLogTextMessage(sender, `Sorry, no handouts/files matched your request details.`);
-                  }
+                  await sendAndLogTextMessage(sender, intent.reply || "Here is your file.");
+                  await sendGDriveFileToUser(sender, driveFiles[0]);
                 } else {
-                  await sendAndLogTextMessage(sender, `Sorry, I couldn't find a file named "${intent.filename}".`);
+                  await sendAndLogTextMessage(sender, `Sorry, couldn't find "${intent.filename}".`);
                 }
-              } catch (err) {
-                console.error("Error in AI send_file intent:", err);
-                await sendAndLogTextMessage(sender, "Sorry, I found the file but failed to send it. Please try again.");
               }
             }
             break;
-
           case 'chat':
           default:
             await sendAndLogTextMessage(sender, intent.reply || "I'm not sure how to help with that.");
@@ -460,14 +313,11 @@ export async function POST(request: Request) {
       }
     });
 
-    // Await execution of all webhook messages in the payload batch
     await Promise.all(processPromises);
-
     return new NextResponse('OK', { status: 200 });
-
-  } catch (error) {
+  } catch (error: any) {
+    addLog('error', `Webhook crash: ${error.message}`);
     console.error('Webhook Error:', error);
-    // CRITICAL: Always return 200 to WhatsApp to prevent infinite retries.
     return new NextResponse('OK', { status: 200 });
   }
 }
