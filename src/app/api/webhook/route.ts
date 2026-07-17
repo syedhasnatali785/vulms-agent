@@ -68,7 +68,7 @@ function isConversationalQuery(text: string): boolean {
  *   → contextTerms: ["final"] (normalized from "finale")
  *   → Drive search: name contains 'cs405' AND name contains 'final'
  */
-function extractSmartSearchParams(text: string): { courseCode: string | null; contextTerms: string[] } {
+function extractSmartSearchParams(text: string): { courseCode: string | null; contextTerms: string[]; excludeTerms: string[] } {
   const lowerText = text.toLowerCase();
   
   // Extract course code (letters + digits pattern like cs405, eng201)
@@ -76,6 +76,9 @@ function extractSmartSearchParams(text: string): { courseCode: string | null; co
   const courseCode = codeMatch ? `${codeMatch[1]}${codeMatch[2]}` : null;
   
   const terms: string[] = [];
+
+  const wantsFinal = lowerText.includes('final');
+  const wantsMid = lowerText.includes('mid');
 
   if (courseCode) {
     // Split message into words using standard separators
@@ -103,9 +106,19 @@ function extractSmartSearchParams(text: string): { courseCode: string | null; co
     }
   }
 
+  // Build exclusion list:
+  // If user wants final but NOT mid → exclude midterm/mid files
+  // If user wants mid but NOT final → exclude final files  
+  const excludeTerms: string[] = [];
+  if (wantsFinal && !wantsMid) {
+    excludeTerms.push('mid', 'midterm');
+  } else if (wantsMid && !wantsFinal) {
+    excludeTerms.push('final', 'finalterm');
+  }
+
   // Deduplicate matched terms
   const uniqueTerms = Array.from(new Set(terms));
-  return { courseCode, contextTerms: uniqueTerms };
+  return { courseCode, contextTerms: uniqueTerms, excludeTerms };
 }
 
 /** Helper: sends a text message and logs it to Supabase + in-memory logs */
@@ -229,23 +242,37 @@ export async function POST(request: Request) {
           addLog('info', `Greeting detected, skipping file search for "${text}"`);
           // Fall through to AI
         } else {
-          // Smart extraction: "cs405 finale term files send kar do" → code=cs405, context=[final]
-          const { courseCode, contextTerms } = extractSmartSearchParams(text);
-          addLog('info', `Extracted: code=${courseCode}, context=[${contextTerms}]`);
+          // Smart extraction: "cs405 finale term files send kar do" → code=cs405, context=[final], exclude=[mid]
+          const { courseCode, contextTerms, excludeTerms } = extractSmartSearchParams(text);
+          addLog('info', `Extracted: code=${courseCode}, context=[${contextTerms}], exclude=[${excludeTerms}]`);
 
           if (courseCode) {
             try {
               // Search Supabase
-              const dbFiles = await getFilesByKeywords([courseCode], contextTerms);
+              let dbFiles = await getFilesByKeywords([courseCode], contextTerms);
+              // Apply exclusion filter: remove files whose name contains any excluded term
+              if (excludeTerms.length > 0) {
+                const before = dbFiles.length;
+                dbFiles = dbFiles.filter(f => !excludeTerms.some(ex => f.filename.toLowerCase().includes(ex)));
+                if (before !== dbFiles.length) addLog('info', `Excluded ${before - dbFiles.length} DB midterm/final file(s)`);
+              }
               addLog('info', `Supabase: ${dbFiles.length} files for "${courseCode}"`);
 
               // Search Google Drive
-              const driveFiles = await searchGDriveFiles(courseCode, contextTerms);
+              let driveFiles = await searchGDriveFiles(courseCode, contextTerms);
+              // Apply exclusion filter: remove files whose name contains any excluded term
+              if (excludeTerms.length > 0) {
+                const before = driveFiles.length;
+                driveFiles = driveFiles.filter(f => !excludeTerms.some(ex => f.name.toLowerCase().includes(ex)));
+                if (before !== driveFiles.length) addLog('info', `Excluded ${before - driveFiles.length} GDrive midterm/final file(s)`);
+              }
               addLog('info', `GDrive: ${driveFiles.length} files for "${courseCode}"`);
 
               const totalCount = dbFiles.length + driveFiles.length;
               if (totalCount > 0) {
-                await sendAndLogTextMessage(sender, `Found ${totalCount} file(s) matching "${courseCode}" ${contextTerms.length > 0 ? `(${contextTerms.join(', ')})` : ''}:`);
+                const contextLabel = contextTerms.length > 0 ? `(${contextTerms.join(', ')})` : '';
+                const excludeLabel = excludeTerms.length > 0 ? ` [excluding: ${excludeTerms.join(', ')}]` : '';
+                await sendAndLogTextMessage(sender, `Found ${totalCount} file(s) matching "${courseCode}" ${contextLabel}${excludeLabel}:`);
 
                 for (const file of dbFiles) {
                   try { await sendFileToUser(sender, file); } catch (err: any) {
