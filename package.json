@@ -13,8 +13,10 @@
     "@aws-sdk/s3-request-presigner": "^3.1079.0",
     "@cloudflare/ai": "^1.2.2",
     "@supabase/supabase-js": "^2.110.0",
+    "@types/node-cron": "^3.0.11",
     "axios": "^1.18.1",
     "next": "16.2.10",
+    "node-cron": "^4.6.0",
     "react": "19.2.4",
     "react-dom": "19.2.4"
   },
