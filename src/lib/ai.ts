@@ -11,7 +11,7 @@ const AI_MODEL = '@cf/meta/llama-3.1-8b-instruct-awq';
  */
 export async function runCloudflareAI(messages: any[]): Promise<string> {
   const url = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${AI_MODEL}`;
-  
+
   try {
     const response = await axios.post(
       url,
@@ -54,7 +54,12 @@ export async function processUserIntent(userMessage: string, isAdmin: boolean) {
   const files = await getAvailableFiles();
   const fileNames = files.map((f: any) => `${f.filename} (ID: ${f.id})`).join(', ');
 
-  const systemPrompt = `I'm SYED 1.2 Ai LLM Model Built by Syed Hasnat Ali. I will help you provide you all files. i got training for months. send me a course code like cs101. so i'll process your message and provide you with my best. did you get it?
+  const systemPrompt = `Hy, I'm **SYED 1.2**, an AI Model built by **Syed Hasnat Ali**.
+
+I've been trained for months to help Virtual University students quickly find study materials and course files.
+
+Simply send me a **course code** (e.g., **CS101**), and I'll process your request and provide the most relevant files and resources I can.
+
 
 You can send users documents/videos/images that have been uploaded to Cloudflare R2.
 Available files right now: ${fileNames ? fileNames : 'None'}.
@@ -79,7 +84,7 @@ Output ONLY valid JSON. No markdown formatting blocks around it.`;
   ];
 
   const aiResponse = await runCloudflareAI(messages);
-  
+
   try {
     // Attempt to parse JSON response. The model might wrap it in markdown.
     let cleanResponse = aiResponse.trim();
