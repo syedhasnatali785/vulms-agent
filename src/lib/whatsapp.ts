@@ -12,13 +12,14 @@ const whatsappApi = axios.create({
 });
 
 export async function sendTextMessage(to: string, text: string) {
+  const bodyText = typeof text === 'object' ? JSON.stringify(text) : String(text || '');
   try {
     const response = await whatsappApi.post('/messages', {
       messaging_product: 'whatsapp',
       recipient_type: 'individual',
       to,
       type: 'text',
-      text: { body: text },
+      text: { body: bodyText },
     });
     return response.data;
   } catch (error: any) {
@@ -38,10 +39,11 @@ export async function sendMediaMessage(to: string, mediaType: 'image' | 'video' 
 
     payload[mediaType] = { link: mediaUrl };
     if (caption) {
+      const captionText = typeof caption === 'object' ? JSON.stringify(caption) : String(caption || '');
       if (mediaType === 'document') {
-        payload[mediaType].filename = caption;
+        payload[mediaType].filename = captionText;
       } else {
-        payload[mediaType].caption = caption;
+        payload[mediaType].caption = captionText;
       }
     }
 

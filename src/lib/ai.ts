@@ -3,7 +3,7 @@ import { getAvailableFiles } from './supabase';
 
 const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID!;
 const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN!;
-const AI_MODEL = process.env.CLOUDFLARE_AI_MODEL || '@cf/meta/llama-3.1-8b-instruct-fast';
+const AI_MODEL = process.env.CLOUDFLARE_AI_MODEL || '@cf/meta/llama-3.2-1b-instruct';
 
 /**
  * We use Cloudflare Workers AI via REST API because Vercel Serverless
@@ -27,12 +27,23 @@ export async function runCloudflareAI(messages: any[]): Promise<string> {
 
     // Cloudflare can return 200 with { success: false, result: {}, errors: [...] }
     const data = response.data;
-    if (!data?.success || !data?.result?.response) {
+    if (!data?.success) {
       console.error('Cloudflare AI returned unsuccessful response:', JSON.stringify(data));
       throw new Error(`Cloudflare AI error: success=${data?.success}, errors=${JSON.stringify(data?.errors || [])}`);
     }
 
-    return data.result.response;
+    // Try standard choices format first, then fall back to response field
+    const content = data?.result?.choices?.[0]?.message?.content ?? data?.result?.response;
+    if (content === undefined || content === null) {
+      console.error('Cloudflare AI did not return a response/content:', JSON.stringify(data));
+      throw new Error(`Cloudflare AI error: No response content found in result.`);
+    }
+
+    // Ensure content returned is a string
+    if (typeof content === 'object') {
+      return JSON.stringify(content);
+    }
+    return String(content);
   } catch (error: any) {
     const status = error.response?.status;
     const errData = error.response?.data;
@@ -94,10 +105,18 @@ Output ONLY valid JSON. No markdown formatting blocks around it.`;
     if (cleanResponse.startsWith('```')) {
       cleanResponse = cleanResponse.replace(/^```\n?/, '').replace(/\n?```$/, '');
     }
-    return JSON.parse(cleanResponse);
+    const parsed = JSON.parse(cleanResponse);
+    if (parsed && typeof parsed === 'object') {
+      if (parsed.reply && typeof parsed.reply === 'object') {
+        parsed.reply = JSON.stringify(parsed.reply);
+      }
+      return parsed;
+    }
+    return { type: 'chat', reply: cleanResponse };
   } catch (e) {
     console.error("Failed to parse AI JSON response:", aiResponse);
     // Return the raw text as a chat reply so the user still gets a response
-    return { type: 'chat', reply: aiResponse || "I didn't quite catch that. Can you rephrase?" };
+    const replyText = typeof aiResponse === 'object' ? JSON.stringify(aiResponse) : String(aiResponse || '');
+    return { type: 'chat', reply: replyText || "I didn't quite catch that. Can you rephrase?" };
   }
 }
