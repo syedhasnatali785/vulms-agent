@@ -35,6 +35,61 @@ export default function Home() {
   const [datesheet, setDatesheet] = useState<DatesheetState | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>('inbox');
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [retryingId, setRetryingId] = useState<string | null>(null);
+  const [retryStatus, setRetryStatus] = useState<{ [key: string]: 'success' | 'error' | null }>({});
+
+  const handleRetry = async (msg: Message) => {
+    setRetryingId(msg.id);
+    setRetryStatus(prev => ({ ...prev, [msg.id]: null }));
+    try {
+      const payload = {
+        object: 'whatsapp_business_account',
+        entry: [
+          {
+            changes: [
+              {
+                value: {
+                  messages: [
+                    {
+                      id: `retry_${msg.id}_${Date.now()}`,
+                      from: msg.sender,
+                      type: 'text',
+                      text: {
+                        body: msg.text
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      };
+
+      const res = await fetch('/api/webhook', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (res.ok) {
+        setRetryStatus(prev => ({ ...prev, [msg.id]: 'success' }));
+        setTimeout(() => {
+          fetchMessages();
+          fetchLogs();
+          fetchStats();
+        }, 1500);
+      } else {
+        setRetryStatus(prev => ({ ...prev, [msg.id]: 'error' }));
+      }
+    } catch (e) {
+      setRetryStatus(prev => ({ ...prev, [msg.id]: 'error' }));
+    } finally {
+      setRetryingId(null);
+    }
+  };
 
   const fetchMessages = async () => {
     try {
@@ -258,7 +313,40 @@ export default function Home() {
                     <div className={`px-4 py-2.5 rounded-2xl text-sm leading-relaxed ${msg.direction === 'incoming' ? 'bg-zinc-900 border border-zinc-800 text-zinc-200 rounded-tl-none' : 'bg-blue-600 text-white rounded-tr-none'}`}>
                       <p className="whitespace-pre-wrap">{msg.text}</p>
                     </div>
-                    <span className="text-[10px] text-zinc-600 px-1">{formatTime(msg.created_at)}</span>
+                    <div className="flex items-center gap-2 mt-1 px-1">
+                      <span className="text-[10px] text-zinc-600">{formatTime(msg.created_at)}</span>
+                      {msg.direction === 'incoming' && (
+                        <button
+                          onClick={() => handleRetry(msg)}
+                          disabled={retryingId !== null}
+                          className={`text-[10px] font-semibold flex items-center gap-1 px-1.5 py-0.5 rounded transition-all duration-200 cursor-pointer ${
+                            retryingId === msg.id
+                              ? 'text-amber-400 bg-amber-500/10 cursor-not-allowed'
+                              : retryStatus[msg.id] === 'success'
+                              ? 'text-emerald-400 bg-emerald-500/10'
+                              : retryStatus[msg.id] === 'error'
+                              ? 'text-rose-400 bg-rose-500/10 hover:bg-rose-500/20'
+                              : 'text-zinc-500 hover:text-blue-400 hover:bg-zinc-850/50'
+                          }`}
+                        >
+                          {retryingId === msg.id ? (
+                            <>
+                              <svg className="animate-spin h-2.5 w-2.5" fill="none" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                              </svg>
+                              Retrying...
+                            </>
+                          ) : retryStatus[msg.id] === 'success' ? (
+                            <>✓ Retried</>
+                          ) : retryStatus[msg.id] === 'error' ? (
+                            <>✗ Failed</>
+                          ) : (
+                            <>↺ Retry</>
+                          )}
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
               ))}
