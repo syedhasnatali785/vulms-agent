@@ -4,6 +4,7 @@ import { downloadWhatsAppMedia, sendTextMessage, sendMediaMessage } from '@/lib/
 import { uploadFileToR2, getFileUrl } from '@/lib/r2';
 import { processUserIntent } from '@/lib/ai';
 import { searchGDriveFiles } from '@/lib/gdrive';
+import { isMidtermFile, isFinalTermFile } from '@/lib/fileFilters';
 
 export const maxDuration = 10;
 export const dynamic = 'force-dynamic';
@@ -128,10 +129,12 @@ async function sendAndLogTextMessage(to: string, text: string) {
   addLog('info', `→ Bot to ${to}: ${text.substring(0, 100)}`);
 }
 
-async function sendFileToUser(sender: string, file: any) {
-  if (file.filename.toLowerCase().includes('midterm')) {
-    addLog('warn', `Blocked sending file "${file.filename}" because it contains "midterm"`);
-    return;
+async function sendFileToUser(sender: string, file: any, isSenderAdmin: boolean) {
+  if (!isSenderAdmin) {
+    if (isMidtermFile(file.filename) || !isFinalTermFile(file.filename)) {
+      addLog('warn', `Blocked sending file "${file.filename}" because it is not a final term file`);
+      return;
+    }
   }
   const fileUrl = await getFileUrl(file.r2_key);
   const mediaType = file.mime_type.startsWith('image') ? 'image'
@@ -141,10 +144,12 @@ async function sendFileToUser(sender: string, file: any) {
   addLog('info', `→ Sent file "${file.filename}" to ${sender}`);
 }
 
-async function sendGDriveFileToUser(sender: string, file: any) {
-  if (file.name.toLowerCase().includes('midterm')) {
-    addLog('warn', `Blocked sending GDrive file "${file.name}" because it contains "midterm"`);
-    return;
+async function sendGDriveFileToUser(sender: string, file: any, isSenderAdmin: boolean) {
+  if (!isSenderAdmin) {
+    if (isMidtermFile(file.name) || !isFinalTermFile(file.name)) {
+      addLog('warn', `Blocked sending GDrive file "${file.name}" because it is not a final term file`);
+      return;
+    }
   }
   const fileUrl = `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media&key=${process.env.GOOGLE_API_KEY}`;
   const mediaType = file.mimeType.startsWith('image') ? 'image'
@@ -258,23 +263,31 @@ export async function POST(request: Request) {
             try {
               // Search Supabase
               let dbFiles = await getFilesByKeywords([courseCode], contextTerms);
-              dbFiles = dbFiles.filter(f => !f.filename.toLowerCase().includes('midterm'));
-              // Apply exclusion filter: remove files whose name contains any excluded term
-              if (excludeTerms.length > 0) {
-                const before = dbFiles.length;
-                dbFiles = dbFiles.filter(f => !excludeTerms.some(ex => f.filename.toLowerCase().includes(ex)));
-                if (before !== dbFiles.length) addLog('info', `Excluded ${before - dbFiles.length} DB midterm/final file(s)`);
+              if (!isSenderAdmin) {
+                dbFiles = dbFiles.filter(f => !isMidtermFile(f.filename) && isFinalTermFile(f.filename));
+              } else {
+                dbFiles = dbFiles.filter(f => !f.filename.toLowerCase().includes('midterm'));
+                // Apply exclusion filter: remove files whose name contains any excluded term
+                if (excludeTerms.length > 0) {
+                  const before = dbFiles.length;
+                  dbFiles = dbFiles.filter(f => !excludeTerms.some(ex => f.filename.toLowerCase().includes(ex)));
+                  if (before !== dbFiles.length) addLog('info', `Excluded ${before - dbFiles.length} DB midterm/final file(s)`);
+                }
               }
               addLog('info', `Supabase: ${dbFiles.length} files for "${courseCode}"`);
 
               // Search Google Drive
               let driveFiles = await searchGDriveFiles(courseCode, contextTerms);
-              driveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
-              // Apply exclusion filter: remove files whose name contains any excluded term
-              if (excludeTerms.length > 0) {
-                const before = driveFiles.length;
-                driveFiles = driveFiles.filter(f => !excludeTerms.some(ex => f.name.toLowerCase().includes(ex)));
-                if (before !== driveFiles.length) addLog('info', `Excluded ${before - driveFiles.length} GDrive midterm/final file(s)`);
+              if (!isSenderAdmin) {
+                driveFiles = driveFiles.filter(f => !isMidtermFile(f.name) && isFinalTermFile(f.name));
+              } else {
+                driveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
+                // Apply exclusion filter: remove files whose name contains any excluded term
+                if (excludeTerms.length > 0) {
+                  const before = driveFiles.length;
+                  driveFiles = driveFiles.filter(f => !excludeTerms.some(ex => f.name.toLowerCase().includes(ex)));
+                  if (before !== driveFiles.length) addLog('info', `Excluded ${before - driveFiles.length} GDrive midterm/final file(s)`);
+                }
               }
               addLog('info', `GDrive: ${driveFiles.length} files for "${courseCode}"`);
 
@@ -285,12 +298,12 @@ export async function POST(request: Request) {
                 await sendAndLogTextMessage(sender, `Found ${totalCount} file(s) matching "${courseCode}" ${contextLabel}${excludeLabel}:`);
 
                 for (const file of dbFiles) {
-                  try { await sendFileToUser(sender, file); } catch (err: any) {
+                  try { await sendFileToUser(sender, file, isSenderAdmin); } catch (err: any) {
                     addLog('error', `Failed sending DB file: ${err.message}`);
                   }
                 }
                 for (const file of driveFiles) {
-                  try { await sendGDriveFileToUser(sender, file); } catch (err: any) {
+                  try { await sendGDriveFileToUser(sender, file, isSenderAdmin); } catch (err: any) {
                     addLog('error', `Failed sending GDrive file: ${err.message}`);
                   }
                 }
@@ -307,22 +320,30 @@ export async function POST(request: Request) {
           const wordCount = text.split(/\s+/).length;
           if (wordCount <= 4 && !isConversationalQuery(text)) {
             const dbFile = await getFileByIdOrNameOrMessageId(text);
-            if (dbFile && !dbFile.filename.toLowerCase().includes('midterm')) {
-              try {
-                await sendAndLogTextMessage(sender, `Found file: ${dbFile.filename}`);
-                await sendFileToUser(sender, dbFile);
-                return;
-              } catch (err: any) {
-                addLog('error', `Direct file send error: ${err.message}`);
+            if (dbFile) {
+              const allowed = isSenderAdmin || (!isMidtermFile(dbFile.filename) && isFinalTermFile(dbFile.filename));
+              if (allowed) {
+                try {
+                  await sendAndLogTextMessage(sender, `Found file: ${dbFile.filename}`);
+                  await sendFileToUser(sender, dbFile, isSenderAdmin);
+                  return;
+                } catch (err: any) {
+                  addLog('error', `Direct file send error: ${err.message}`);
+                }
               }
             }
 
             const driveFiles = await searchGDriveFiles(text);
-            const filteredDriveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
+            let filteredDriveFiles = driveFiles;
+            if (!isSenderAdmin) {
+              filteredDriveFiles = driveFiles.filter(f => !isMidtermFile(f.name) && isFinalTermFile(f.name));
+            } else {
+              filteredDriveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
+            }
             if (filteredDriveFiles.length > 0) {
               try {
                 await sendAndLogTextMessage(sender, `Found: ${filteredDriveFiles[0].name}`);
-                await sendGDriveFileToUser(sender, filteredDriveFiles[0]);
+                await sendGDriveFileToUser(sender, filteredDriveFiles[0], isSenderAdmin);
                 return;
               } catch (err: any) {
                 addLog('error', `Direct GDrive send error: ${err.message}`);
@@ -354,15 +375,20 @@ export async function POST(request: Request) {
             if (intent.filename) {
               const { contextTerms } = extractSmartSearchParams(text);
               const dbFile = await getFileByIdOrNameOrMessageId(intent.filename);
-              if (dbFile && !dbFile.filename.toLowerCase().includes('midterm')) {
+              if (dbFile && (isSenderAdmin || (!isMidtermFile(dbFile.filename) && isFinalTermFile(dbFile.filename)))) {
                 await sendAndLogTextMessage(sender, intent.reply || "Here is your file.");
-                await sendFileToUser(sender, dbFile);
+                await sendFileToUser(sender, dbFile, isSenderAdmin);
               } else {
                 const driveFiles = await searchGDriveFiles(intent.filename, contextTerms);
-                const filteredDriveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
+                let filteredDriveFiles = driveFiles;
+                if (!isSenderAdmin) {
+                  filteredDriveFiles = driveFiles.filter(f => !isMidtermFile(f.name) && isFinalTermFile(f.name));
+                } else {
+                  filteredDriveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
+                }
                 if (filteredDriveFiles.length > 0) {
                   await sendAndLogTextMessage(sender, intent.reply || "Here is your file.");
-                  await sendGDriveFileToUser(sender, filteredDriveFiles[0]);
+                  await sendGDriveFileToUser(sender, filteredDriveFiles[0], isSenderAdmin);
                 } else {
                   await sendAndLogTextMessage(sender, `Sorry, couldn't find "${intent.filename}".`);
                 }

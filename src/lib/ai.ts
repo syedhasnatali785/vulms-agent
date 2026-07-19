@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { getAvailableFiles } from './supabase';
+import { isMidtermFile, isFinalTermFile } from './fileFilters';
 
 const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID!;
 const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN!;
@@ -62,7 +63,10 @@ export async function runCloudflareAI(messages: any[]): Promise<string> {
  * { type: 'add_admin', newNumber: '...', reply: '...' }
  */
 export async function processUserIntent(userMessage: string, isAdmin: boolean) {
-  const files = await getAvailableFiles();
+  let files = await getAvailableFiles();
+  if (!isAdmin) {
+    files = files.filter((f: any) => !isMidtermFile(f.filename) && isFinalTermFile(f.filename));
+  }
   const fileNames = files.map((f: any) => `${f.filename} (ID: ${f.id})`).join(', ');
 
   const systemPrompt = `Hy, I'm **SYED 1.2**, an AI Model built by **Syed Hasnat Ali**.
