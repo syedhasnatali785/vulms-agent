@@ -61,7 +61,7 @@ export async function runCloudflareAI(messages: any[]): Promise<string> {
  * { type: 'send_file', filename: '...', reply: '...' }
  * { type: 'add_admin', newNumber: '...', reply: '...' }
  */
-export async function processUserIntent(userMessage: string, isAdmin: boolean) {
+export async function processUserIntent(userMessage: string) {
   const files = await getAvailableFiles();
   const fileNames = files.map((f: any) => `${f.filename} (ID: ${f.id})`).join(', ');
 
@@ -72,25 +72,21 @@ You must validate the user's message and determine their intent. You must output
 Possible intents are:
 1. "search_batch": The user is requesting materials, documents, files, past papers, or handouts for one or more courses/files.
    Validate that the user is actually requesting course codes or files. If they are, extract each course/file request into a structured list.
+   
+   IMPORTANT Guidelines for Extraction:
+   - If the user asks for files of specific course codes (e.g., "mth301", "cs502"), extract the course code (e.g., "mth301") as "courseCode" and any context keywords (like "handouts", "final", "solved") as "contextTerms".
+   - If the user specifies or pastes a specific filename or file name with extension (for example: "CS601 FINAL TERM FILE 2 SOLVED BY HADI.pdf" or "mth101_past_papers.pdf"), extract the full filename EXACTLY as the "courseCode" and leave "contextTerms" empty.
+   
    Format:
    {
      "type": "search_batch",
      "requests": [
-       { "courseCode": "<extracted course code or specific file name/id>", "contextTerms": [<optional list of context keywords like "final", "mid", "handout", "highlight", "past", "paper", "solved">] }
+       { "courseCode": "<extracted course code or exact filename/id>", "contextTerms": [<optional list of context keywords like "final", "mid", "handout", "highlight", "past", "paper", "solved">] }
      ],
      "reply": "<friendly confirmation message acknowledging the search requests>"
    }
 
-2. "add_admin": An ADMIN user is asking to add a new admin phone number (e.g., "add admin 923001234567").
-   Format:
-   {
-     "type": "add_admin",
-     "newNumber": "<extracted phone number>",
-     "reply": "Processing admin registration..."
-   }
-   Note: Only allow this if the user's role is ADMIN. Otherwise, decline as a normal chat.
-
-3. "chat": The user is greeting you, asking conversational questions, saying thanks, or the query is not asking for files/courses.
+2. "chat": The user is greeting you, asking conversational questions, saying thanks, or the query is not asking for files/courses.
    Format:
    {
      "type": "chat",
@@ -98,11 +94,13 @@ Possible intents are:
    }
 
 Available files right now in database: ${fileNames ? fileNames : 'None'}.
-The user's role is: ${isAdmin ? 'ADMIN' : 'STANDARD USER'}.
 
 Examples:
 - User: "Acha sta301,mth401,mcm301,cs502 ki sab files send krdo"
   Response: { "type": "search_batch", "requests": [{ "courseCode": "sta301", "contextTerms": [] }, { "courseCode": "mth401", "contextTerms": [] }, { "courseCode": "mcm301", "contextTerms": [] }, { "courseCode": "cs502", "contextTerms": [] }], "reply": "Sure, searching files for STA301, MTH401, MCM301, and CS502. Please wait a moment..." }
+
+- User: "please provide me this file: CS601 FINAL TERM FILE 2 SOLVED BY HADI.pdf"
+  Response: { "type": "search_batch", "requests": [{ "courseCode": "CS601 FINAL TERM FILE 2 SOLVED BY HADI.pdf", "contextTerms": [] }], "reply": "Analyzing and searching for CS601 FINAL TERM FILE 2 SOLVED BY HADI.pdf..." }
 
 - User: "CS101 key handouts and midterm solved papers send krdo"
   Response: { "type": "search_batch", "requests": [{ "courseCode": "cs101", "contextTerms": ["handout", "midterm", "solved", "paper"] }], "reply": "Searching for CS101 handouts and midterm solved papers..." }

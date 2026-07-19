@@ -15,28 +15,7 @@ export const supabase = (supabaseUrl && supabaseServiceKey)
     }
   });
 
-export async function isAdmin(phoneNumber: string): Promise<boolean> {
-  const { data, error } = await supabase
-    .from('users')
-    .select('is_admin')
-    .eq('phone_number', phoneNumber)
-    .single();
 
-  if (error || !data) return false;
-  return data.is_admin === true;
-}
-
-export async function addAdmin(newAdminNumber: string, addedBy: string): Promise<boolean> {
-  const { error } = await supabase
-    .from('users')
-    .upsert({
-      phone_number: newAdminNumber,
-      is_admin: true,
-      // optional: track who added them
-    });
-
-  return !error;
-}
 
 export async function saveFileMetadata(filename: string, r2Key: string, mimeType: string, uploadedBy: string, messageId?: string) {
   const insertData: any = { filename, r2_key: r2Key, mime_type: mimeType, uploaded_by: uploadedBy };
