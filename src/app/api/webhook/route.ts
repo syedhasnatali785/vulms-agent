@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { saveFileMetadata, getFileByIdOrNameOrMessageId, extractCourseKeywords, getFilesByKeywords, saveMessage, saveLog } from '@/lib/supabase';
+import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractCourseKeywords, getFilesByKeywords, saveMessage, saveLog } from '@/lib/supabase';
 import { downloadWhatsAppMedia, sendTextMessage, sendMediaMessage } from '@/lib/whatsapp';
 import { uploadFileToR2, getFileUrl } from '@/lib/r2';
 import { processUserIntent } from '@/lib/ai';
@@ -154,80 +154,6 @@ async function sendGDriveFileToUser(sender: string, file: any) {
   addLog('info', `→ Sent GDrive file "${file.name}" to ${sender}`);
 }
 
-async function executeSearchRequest(sender: string, query: string, contextTerms: string[], excludeTerms: string[]): Promise<boolean> {
-  const cleanQuery = query.trim();
-  if (!cleanQuery) return false;
-
-  // 1. Direct file ID/name/message_id check first (for any query length)
-  if (!isConversationalQuery(cleanQuery)) {
-    const dbFile = await getFileByIdOrNameOrMessageId(cleanQuery);
-    if (dbFile && !dbFile.filename.toLowerCase().includes('midterm')) {
-      try {
-        await sendAndLogTextMessage(sender, `Found file: ${dbFile.filename}`);
-        await sendFileToUser(sender, dbFile);
-        return true;
-      } catch (err: any) {
-        addLog('error', `Direct file send error: ${err.message}`);
-      }
-    }
-
-    // Direct Google Drive search first on the full query
-    const driveFiles = await searchGDriveFiles(cleanQuery);
-    const filteredDriveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
-    if (filteredDriveFiles.length > 0) {
-      try {
-        await sendAndLogTextMessage(sender, `Found: ${filteredDriveFiles[0].name}`);
-        await sendGDriveFileToUser(sender, filteredDriveFiles[0]);
-        return true;
-      } catch (err: any) {
-        addLog('error', `Direct GDrive send error: ${err.message}`);
-      }
-    }
-  }
-
-  // 2. Regular Keyword/Smart Search (Supabase) with fallback: split the query if direct search didn't find anything
-  const { courseCode, contextTerms: parsedContext, excludeTerms: parsedExclude } = extractSmartSearchParams(cleanQuery);
-  const searchKeywords = courseCode ? [courseCode] : [cleanQuery];
-  const mergedContext = Array.from(new Set([...contextTerms, ...parsedContext]));
-  const mergedExclude = Array.from(new Set([...excludeTerms, ...parsedExclude]));
-
-  let dbFiles = await getFilesByKeywords(searchKeywords, mergedContext);
-  dbFiles = dbFiles.filter(f => !f.filename.toLowerCase().includes('midterm'));
-  if (mergedExclude.length > 0) {
-    dbFiles = dbFiles.filter(f => !mergedExclude.some(ex => f.filename.toLowerCase().includes(ex)));
-  }
-  addLog('info', `Supabase: ${dbFiles.length} files for keywords=[${searchKeywords}] context=[${mergedContext}]`);
-
-  // 3. Regular Keyword/Smart Search (Google Drive)
-  let driveFiles = await searchGDriveFiles(searchKeywords[0], mergedContext);
-  driveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
-  if (mergedExclude.length > 0) {
-    driveFiles = driveFiles.filter(f => !mergedExclude.some(ex => f.name.toLowerCase().includes(ex)));
-  }
-  addLog('info', `GDrive: ${driveFiles.length} files for keywords=[${searchKeywords}] context=[${mergedContext}]`);
-
-  const totalCount = dbFiles.length + driveFiles.length;
-  if (totalCount > 0) {
-    const contextLabel = mergedContext.length > 0 ? `(${mergedContext.join(', ')})` : '';
-    const excludeLabel = mergedExclude.length > 0 ? ` [excluding: ${mergedExclude.join(', ')}]` : '';
-    await sendAndLogTextMessage(sender, `Found ${totalCount} file(s) for "${cleanQuery}" ${contextLabel}${excludeLabel}:`);
-
-    for (const file of dbFiles) {
-      try { await sendFileToUser(sender, file); } catch (err: any) {
-        addLog('error', `Failed sending DB file: ${err.message}`);
-      }
-    }
-    for (const file of driveFiles) {
-      try { await sendGDriveFileToUser(sender, file); } catch (err: any) {
-        addLog('error', `Failed sending GDrive file: ${err.message}`);
-      }
-    }
-    return true;
-  }
-
-  return false;
-}
-
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const mode = searchParams.get('hub.mode');
@@ -264,6 +190,7 @@ export async function POST(request: Request) {
       const sender = message.from;
       addLog('info', `← Message from ${sender}: type=${message.type}`);
 
+      const isSenderAdmin = await isAdmin(sender);
       const MEDIA_TYPES = ['image', 'video', 'document', 'audio', 'voice', 'sticker'];
 
       // 1. Handle Media Uploads
@@ -318,66 +245,111 @@ export async function POST(request: Request) {
         await saveMessage(sender, text, 'incoming');
         addLog('info', `← ${sender}: "${text}"`);
 
-        // AI Validation and Intent Classification
-        let intent;
-        try {
-          intent = await processUserIntent(text);
-          addLog('info', `AI intent: ${intent.type}`);
-        } catch (aiErr: any) {
-          addLog('error', `AI error: ${aiErr.message}. Using fallback regex extraction.`);
-          
-          // Regex-based Fallback
-          const { courseCode, contextTerms } = extractSmartSearchParams(text);
+        // Skip greetings
+        if (isConversationalQuery(text)) {
+          addLog('info', `Greeting detected, skipping file search for "${text}"`);
+          // Fall through to AI
+        } else {
+          // Smart extraction: "cs405 finale term files send kar do" → code=cs405, context=[final], exclude=[mid]
+          const { courseCode, contextTerms, excludeTerms } = extractSmartSearchParams(text);
+          addLog('info', `Extracted: code=${courseCode}, context=[${contextTerms}], exclude=[${excludeTerms}]`);
+
           if (courseCode) {
-            intent = {
-              type: 'search_batch',
-              requests: [{ courseCode, contextTerms }],
-              reply: `AI was offline, but I'm searching for files matching "${courseCode}"...`
-            };
-          } else {
-            intent = {
-              type: 'chat',
-              reply: "👋Welcome Im  SYED 1.2 , an AI language model built by  Syed Hasnat Ali  📚 Simply send me a  course code  (for example:  CS101 ,  MTH101 , or  ENG201*), and I'll process your request and do my best to provide the relevant files and study materials."
-            };
+            try {
+              // Search Supabase
+              let dbFiles = await getFilesByKeywords([courseCode], contextTerms);
+              dbFiles = dbFiles.filter(f => !f.filename.toLowerCase().includes('midterm'));
+              // Apply exclusion filter: remove files whose name contains any excluded term
+              if (excludeTerms.length > 0) {
+                const before = dbFiles.length;
+                dbFiles = dbFiles.filter(f => !excludeTerms.some(ex => f.filename.toLowerCase().includes(ex)));
+                if (before !== dbFiles.length) addLog('info', `Excluded ${before - dbFiles.length} DB midterm/final file(s)`);
+              }
+              addLog('info', `Supabase: ${dbFiles.length} files for "${courseCode}"`);
+
+              // Search Google Drive
+              let driveFiles = await searchGDriveFiles(courseCode, contextTerms);
+              driveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
+              // Apply exclusion filter: remove files whose name contains any excluded term
+              if (excludeTerms.length > 0) {
+                const before = driveFiles.length;
+                driveFiles = driveFiles.filter(f => !excludeTerms.some(ex => f.name.toLowerCase().includes(ex)));
+                if (before !== driveFiles.length) addLog('info', `Excluded ${before - driveFiles.length} GDrive midterm/final file(s)`);
+              }
+              addLog('info', `GDrive: ${driveFiles.length} files for "${courseCode}"`);
+
+              const totalCount = dbFiles.length + driveFiles.length;
+              if (totalCount > 0) {
+                const contextLabel = contextTerms.length > 0 ? `(${contextTerms.join(', ')})` : '';
+                const excludeLabel = excludeTerms.length > 0 ? ` [excluding: ${excludeTerms.join(', ')}]` : '';
+                await sendAndLogTextMessage(sender, `Found ${totalCount} file(s) matching "${courseCode}" ${contextLabel}${excludeLabel}:`);
+
+                for (const file of dbFiles) {
+                  try { await sendFileToUser(sender, file); } catch (err: any) {
+                    addLog('error', `Failed sending DB file: ${err.message}`);
+                  }
+                }
+                for (const file of driveFiles) {
+                  try { await sendGDriveFileToUser(sender, file); } catch (err: any) {
+                    addLog('error', `Failed sending GDrive file: ${err.message}`);
+                  }
+                }
+                return;
+              }
+
+              addLog('warn', `No files found for "${courseCode}" [${contextTerms}]. Falling through to AI.`);
+            } catch (err: any) {
+              addLog('error', `Search error: ${err.message}`);
+            }
+          }
+
+          // Short direct input check (filename, file ID)
+          const wordCount = text.split(/\s+/).length;
+          if (wordCount <= 4 && !isConversationalQuery(text)) {
+            const dbFile = await getFileByIdOrNameOrMessageId(text);
+            if (dbFile && !dbFile.filename.toLowerCase().includes('midterm')) {
+              try {
+                await sendAndLogTextMessage(sender, `Found file: ${dbFile.filename}`);
+                await sendFileToUser(sender, dbFile);
+                return;
+              } catch (err: any) {
+                addLog('error', `Direct file send error: ${err.message}`);
+              }
+            }
+
+            const driveFiles = await searchGDriveFiles(text);
+            const filteredDriveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
+            if (filteredDriveFiles.length > 0) {
+              try {
+                await sendAndLogTextMessage(sender, `Found: ${filteredDriveFiles[0].name}`);
+                await sendGDriveFileToUser(sender, filteredDriveFiles[0]);
+                return;
+              } catch (err: any) {
+                addLog('error', `Direct GDrive send error: ${err.message}`);
+              }
+            }
           }
         }
 
+        // AI fallback
+        let intent;
+        try {
+          intent = await processUserIntent(text, isSenderAdmin);
+          addLog('info', `AI intent: ${intent.type}`);
+        } catch (aiErr: any) {
+          addLog('error', `AI error: ${aiErr.message}`);
+          intent = { type: 'chat', reply: "👋Welcome Im  SYED 1.2 , an AI language model built by  Syed Hasnat Ali  📚 Simply send me a  course code  (for example:  CS101 ,  MTH101 , or  ENG201*), and I'll process your request and do my best to provide the relevant files and study materials. Just send your course code to get started!" };
+        }
+
         switch (intent.type) {
-          case 'search_batch':
-            if (intent.reply) {
-              await sendAndLogTextMessage(sender, intent.reply);
-            }
-            if (Array.isArray(intent.requests) && intent.requests.length > 0) {
-              // Process requests in a queue (sequentially)
-              for (let i = 0; i < intent.requests.length; i++) {
-                const req = intent.requests[i];
-                const query = req.courseCode || req.query || '';
-                const contextTerms = req.contextTerms || [];
-
-                // Standard exclusion logic for mid/final terms
-                const wantsFinal = text.toLowerCase().includes('final') || contextTerms.some((t: string) => t.toLowerCase().includes('final'));
-                const wantsMid = text.toLowerCase().includes('mid') || contextTerms.some((t: string) => t.toLowerCase().includes('mid'));
-                const excludeTerms: string[] = [];
-                if (wantsFinal && !wantsMid) {
-                  excludeTerms.push('mid', 'midterm');
-                } else if (wantsMid && !wantsFinal) {
-                  excludeTerms.push('final', 'finalterm');
-                }
-
-                addLog('info', `Queue item [${i + 1}/${intent.requests.length}]: searching for "${query}"`);
-                const found = await executeSearchRequest(sender, query, contextTerms, excludeTerms);
-                if (!found) {
-                  await sendAndLogTextMessage(sender, `Sorry, no files found for "${query}".`);
-                }
-
-                // Add 1.5s delay between queue items to prevent rate limits or messages getting out of order
-                if (i < intent.requests.length - 1) {
-                  await new Promise(resolve => setTimeout(resolve, 1500));
-                }
-              }
+          case 'add_admin':
+            if (isSenderAdmin && intent.newNumber) {
+              const success = await addAdmin(intent.newNumber, sender);
+              await sendAndLogTextMessage(sender, success ? `Added ${intent.newNumber} as admin.` : "Failed to add admin.");
+            } else {
+              await sendAndLogTextMessage(sender, "Only admins can add new admins.");
             }
             break;
-
           case 'send_file':
             if (intent.filename) {
               const { contextTerms } = extractSmartSearchParams(text);
@@ -397,7 +369,6 @@ export async function POST(request: Request) {
               }
             }
             break;
-
           case 'chat':
           default:
             await sendAndLogTextMessage(sender, intent.reply || "I'm not sure how to help with that.");

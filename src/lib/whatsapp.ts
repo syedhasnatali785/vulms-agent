@@ -28,7 +28,13 @@ export async function sendTextMessage(to: string, text: string) {
   }
 }
 
-export async function sendMediaMessage(to: string, mediaType: 'image' | 'video' | 'document', mediaUrl: string, filename?: string, caption?: string) {
+export async function sendMediaMessage(
+  to: string,
+  mediaType: 'image' | 'video' | 'document',
+  mediaUrl: string,
+  filename?: string,
+  caption?: string
+) {
   try {
     const payload: any = {
       messaging_product: 'whatsapp',
@@ -38,6 +44,7 @@ export async function sendMediaMessage(to: string, mediaType: 'image' | 'video' 
     };
 
     payload[mediaType] = { link: mediaUrl };
+    
     if (mediaType === 'document') {
       if (filename) {
         payload[mediaType].filename = typeof filename === 'object' ? JSON.stringify(filename) : String(filename || '');
@@ -46,7 +53,10 @@ export async function sendMediaMessage(to: string, mediaType: 'image' | 'video' 
         payload[mediaType].caption = typeof caption === 'object' ? JSON.stringify(caption) : String(caption || '');
       }
     } else {
-      const finalCaption = caption || filename;
+      // For images and videos
+      const finalCaption = caption 
+        ? (filename ? `${filename} ${caption}` : caption)
+        : filename;
       if (finalCaption) {
         payload[mediaType].caption = typeof finalCaption === 'object' ? JSON.stringify(finalCaption) : String(finalCaption || '');
       }
