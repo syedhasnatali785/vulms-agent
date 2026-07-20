@@ -1,7 +1,15 @@
 import axios from 'axios';
+import https from 'https';
 
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN!;
 const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID!;
+
+// Reuse TCP/TLS connections across requests to avoid expensive handshakes
+const keepAliveAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 2000,
+  maxSockets: 100,
+});
 
 const whatsappApi = axios.create({
   baseURL: `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}`,
@@ -9,6 +17,7 @@ const whatsappApi = axios.create({
     Authorization: `Bearer ${WHATSAPP_TOKEN}`,
     'Content-Type': 'application/json',
   },
+  httpsAgent: keepAliveAgent,
 });
 
 export async function sendTextMessage(to: string, text: string) {

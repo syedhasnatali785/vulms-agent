@@ -9,6 +9,13 @@ import { isMidtermFile, isFinalTermFile } from '@/lib/fileFilters';
 export const maxDuration = 10;
 export const dynamic = 'force-dynamic';
 
+/** Split an array into chunks of a given size for batched parallel processing */
+function chunk<T>(arr: T[], size: number): T[][] {
+  return Array.from({ length: Math.ceil(arr.length / size) }, (_, i) =>
+    arr.slice(i * size, i * size + size)
+  );
+}
+
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 
 // In-memory deduplication cache
@@ -297,15 +304,25 @@ export async function POST(request: Request) {
                 const excludeLabel = excludeTerms.length > 0 ? ` [excluding: ${excludeTerms.join(', ')}]` : '';
                 await sendAndLogTextMessage(sender, `Found ${totalCount} file(s) matching "${courseCode}" ${contextLabel}${excludeLabel}:`);
 
-                for (const file of dbFiles) {
-                  try { await sendFileToUser(sender, file, isSenderAdmin); } catch (err: any) {
-                    addLog('error', `Failed sending DB file: ${err.message}`);
-                  }
-                }
-                for (const file of driveFiles) {
-                  try { await sendGDriveFileToUser(sender, file, isSenderAdmin); } catch (err: any) {
-                    addLog('error', `Failed sending GDrive file: ${err.message}`);
-                  }
+                // Send files in parallel batches of 5 for throughput
+                const allFiles = [
+                  ...dbFiles.map(f => ({ source: 'db' as const, file: f })),
+                  ...driveFiles.map(f => ({ source: 'gdrive' as const, file: f })),
+                ];
+                for (const batch of chunk(allFiles, 5)) {
+                  await Promise.all(
+                    batch.map(async ({ source, file }) => {
+                      try {
+                        if (source === 'db') {
+                          await sendFileToUser(sender, file, isSenderAdmin);
+                        } else {
+                          await sendGDriveFileToUser(sender, file, isSenderAdmin);
+                        }
+                      } catch (err: any) {
+                        addLog('error', `Failed sending ${source} file: ${err.message}`);
+                      }
+                    })
+                  );
                 }
                 return;
               }
@@ -403,7 +420,12 @@ export async function POST(request: Request) {
       }
     });
 
-    await Promise.all(processPromises);
+    // Fire-and-forget: return 200 immediately so WhatsApp doesn't retry,
+    // then continue processing in the background (safe on a persistent VPS).
+    Promise.all(processPromises).catch((err) => {
+      addLog('error', `Background processing error: ${err.message}`);
+      console.error('Background processing error:', err);
+    });
     return new NextResponse('OK', { status: 200 });
   } catch (error: any) {
     addLog('error', `Webhook crash: ${error.message}`);
