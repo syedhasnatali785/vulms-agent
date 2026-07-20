@@ -1,8 +1,6 @@
 import { NextResponse } from 'next/server';
-import fs from 'fs';
-import path from 'path';
 import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractCourseKeywords, getFilesByKeywords, saveMessage, saveLog } from '@/lib/supabase';
-import { downloadWhatsAppMedia, sendTextMessage, sendMediaMessage, sendInteractiveButtons } from '@/lib/whatsapp';
+import { downloadWhatsAppMedia, sendTextMessage, sendMediaMessage } from '@/lib/whatsapp';
 import { uploadFileToR2, getFileUrl } from '@/lib/r2';
 import { processUserIntent } from '@/lib/ai';
 import { searchGDriveFiles } from '@/lib/gdrive';
@@ -24,205 +22,8 @@ const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 const processedMessageIds = new Set<string>();
 const MAX_CACHE_SIZE = 1000;
 
-interface QueueItem {
-  courseCode: string;
-  contextTerms: string[];
-  excludeTerms: string[];
-  totalCount: number;
-  dbFiles: any[];
-  driveFiles: any[];
-}
-
-// Persist user queues and last message IDs in local JSON files to support multiple PM2 cluster processes
-const QUEUES_FILE = path.join(process.cwd(), 'user_queues.json');
-const LAST_MSG_FILE = path.join(process.cwd(), 'user_last_messages.json');
-
-function getQueue(sender: string): QueueItem[] {
-  try {
-    if (fs.existsSync(QUEUES_FILE)) {
-      const data = JSON.parse(fs.readFileSync(QUEUES_FILE, 'utf8') || '{}');
-      return data[sender] || [];
-    }
-  } catch (e) {
-    console.error('Error reading user_queues.json:', e);
-  }
-  return [];
-}
-
-function setQueue(sender: string, queue: QueueItem[]) {
-  try {
-    let data: any = {};
-    if (fs.existsSync(QUEUES_FILE)) {
-      data = JSON.parse(fs.readFileSync(QUEUES_FILE, 'utf8') || '{}');
-    }
-    data[sender] = queue;
-    fs.writeFileSync(QUEUES_FILE, JSON.stringify(data, null, 2), 'utf8');
-  } catch (e) {
-    console.error('Error writing user_queues.json:', e);
-  }
-}
-
-function deleteQueue(sender: string) {
-  try {
-    if (fs.existsSync(QUEUES_FILE)) {
-      const data = JSON.parse(fs.readFileSync(QUEUES_FILE, 'utf8') || '{}');
-      delete data[sender];
-      fs.writeFileSync(QUEUES_FILE, JSON.stringify(data, null, 2), 'utf8');
-    }
-  } catch (e) {
-    console.error('Error deleting queue:', e);
-  }
-}
-
-function hasQueue(sender: string): boolean {
-  return getQueue(sender).length > 0;
-}
-
-function getLastMessageId(sender: string): string {
-  try {
-    if (fs.existsSync(LAST_MSG_FILE)) {
-      const data = JSON.parse(fs.readFileSync(LAST_MSG_FILE, 'utf8') || '{}');
-      return data[sender] || '';
-    }
-  } catch (e) {
-    console.error('Error reading user_last_messages.json:', e);
-  }
-  return '';
-}
-
-function setLastMessageId(sender: string, messageId: string) {
-  try {
-    let data: any = {};
-    if (fs.existsSync(LAST_MSG_FILE)) {
-      data = JSON.parse(fs.readFileSync(LAST_MSG_FILE, 'utf8') || '{}');
-    }
-    data[sender] = messageId;
-    fs.writeFileSync(LAST_MSG_FILE, JSON.stringify(data, null, 2), 'utf8');
-  } catch (e) {
-    console.error('Error writing user_last_messages.json:', e);
-  }
-}
-
-function extractDistinctCourseCodes(text: string): string[] {
-  const coursePattern = /\b([a-zA-Z]{2,5})\s*[-_]?\s*(\d{2,4})\b/gi;
-  const codes = new Set<string>();
-  let match;
-  while ((match = coursePattern.exec(text)) !== null) {
-    codes.add(`${match[1].toLowerCase()}${match[2]}`);
-  }
-  return Array.from(codes);
-}
-
-async function askUserForFirstQueueItem(sender: string) {
-  const queue = getQueue(sender);
-  if (!queue || queue.length === 0) {
-    deleteQueue(sender);
-    return;
-  }
-  
-  const currentItem = queue[0];
-  const courseUpper = currentItem.courseCode.toUpperCase();
-  const msg = `I found ${currentItem.totalCount} files for this course ${courseUpper}.\n\nWould you like me to send all files for this ${courseUpper} course?`;
-  
-  try {
-    await sendInteractiveButtons(sender, msg, [
-      { id: `queue_yes_${currentItem.courseCode}`, title: 'Yes' },
-      { id: `queue_no_${currentItem.courseCode}`, title: 'No' }
-    ]);
-    addLog('info', `→ Sent button invitation to ${sender} for ${courseUpper}`);
-  } catch (err: any) {
-    addLog('error', `Failed sending interactive button message to ${sender}: ${err.message}`);
-    // Fallback: send text message
-    await sendAndLogTextMessage(sender, `${msg}\n\n(Reply with Yes or No to confirm)`);
-  }
-}
-
-async function handleQueueInteraction(sender: string, courseCode: string, isYes: boolean, isSenderAdmin: boolean, messageId?: string) {
-  const queue = getQueue(sender);
-  if (!queue || queue.length === 0) {
-    addLog('warn', `Interaction received for user ${sender} but queue is empty.`);
-    deleteQueue(sender);
-    return;
-  }
-  
-  const currentItem = queue[0];
-  if (currentItem.courseCode !== courseCode) {
-    addLog('warn', `Queue mismatch for user ${sender}: expected ${currentItem.courseCode}, got ${courseCode}`);
-    return;
-  }
-  
-  // Remove the current item from the queue
-  queue.shift();
-  setQueue(sender, queue);
-  
-  const courseUpper = courseCode.toUpperCase();
-  
-  if (isYes) {
-    await sendAndLogTextMessage(sender, `Starting to send files for ${courseUpper}...`);
-    
-    // Set userLastMessageId so any new text messages can cancel this send operation
-    if (messageId) {
-      setLastMessageId(sender, messageId);
-    }
-    
-    const allFiles = [
-      ...currentItem.dbFiles.map(f => ({ source: 'db' as const, file: f })),
-      ...currentItem.driveFiles.map(f => ({ source: 'gdrive' as const, file: f })),
-    ];
-    
-    // Process sending files in the background using chunked parallel batches of 5
-    (async () => {
-      try {
-        for (const batch of chunk(allFiles, 5)) {
-          // Check if aborted
-          if (messageId && getLastMessageId(sender) !== messageId) {
-            addLog('warn', `Aborted file sending for ${sender} because they sent a new message.`);
-            return;
-          }
-          await Promise.all(
-            batch.map(async ({ source, file }) => {
-              try {
-                if (messageId && getLastMessageId(sender) !== messageId) {
-                  return;
-                }
-                if (source === 'db') {
-                  await sendFileToUser(sender, file, isSenderAdmin);
-                } else {
-                  await sendGDriveFileToUser(sender, file, isSenderAdmin);
-                }
-              } catch (err: any) {
-                addLog('error', `Failed sending ${source} file: ${err.message}`);
-              }
-            })
-          );
-        }
-        
-        // Check if there is still a queue and if it's the active session
-        const updatedQueue = getQueue(sender);
-        if (updatedQueue && updatedQueue.length > 0) {
-          // Wait 2.5 seconds before prompting the next item so messages don't overlap too fast
-          setTimeout(async () => {
-            await askUserForFirstQueueItem(sender);
-          }, 2500);
-        } else {
-          deleteQueue(sender);
-          await sendAndLogTextMessage(sender, `All files for ${courseUpper} sent successfully!`);
-        }
-      } catch (err: any) {
-        addLog('error', `Error in background file sending for ${courseUpper}: ${err.message}`);
-      }
-    })();
-  } else {
-    addLog('info', `User ${sender} skipped sending files for ${courseUpper}.`);
-    
-    if (queue.length > 0) {
-      await askUserForFirstQueueItem(sender);
-    } else {
-      deleteQueue(sender);
-      await sendAndLogTextMessage(sender, `Skipped sending files for ${courseUpper}. No more pending courses in queue.`);
-    }
-  }
-}
+// Track the latest message ID processed for each user to cancel ongoing batch sends if they respond
+const userLastMessageId = new Map<string, string>();
 
 function isDuplicateMessage(messageId: string): boolean {
   if (processedMessageIds.has(messageId)) return true;
@@ -403,30 +204,11 @@ export async function POST(request: Request) {
 
       const sender = message.from;
       if (messageId && sender) {
-        setLastMessageId(sender, messageId);
+        userLastMessageId.set(sender, messageId);
       }
       addLog('info', `← Message from ${sender}: type=${message.type}`);
 
       const isSenderAdmin = await isAdmin(sender);
-
-      // 0. Handle Interactive Button Replies
-      if (message.type === 'interactive') {
-        const interactiveType = message.interactive?.type;
-        if (interactiveType === 'button_reply') {
-          const buttonId = message.interactive.button_reply?.id || '';
-          const buttonTitle = message.interactive.button_reply?.title || '';
-          await saveMessage(sender, `[Button Clicked]: ${buttonTitle} (${buttonId})`, 'incoming');
-          addLog('info', `← ${sender} clicked button: ${buttonTitle} (${buttonId})`);
-
-          if (buttonId.startsWith('queue_yes_') || buttonId.startsWith('queue_no_')) {
-            const isYes = buttonId.startsWith('queue_yes_');
-            const courseCode = buttonId.replace(isYes ? 'queue_yes_' : 'queue_no_', '');
-            await handleQueueInteraction(sender, courseCode, isYes, isSenderAdmin, messageId);
-            return;
-          }
-        }
-      }
-
       const MEDIA_TYPES = ['image', 'video', 'document', 'audio', 'voice', 'sticker'];
 
       // 1. Handle Media Uploads
@@ -481,119 +263,126 @@ export async function POST(request: Request) {
         await saveMessage(sender, text, 'incoming');
         addLog('info', `← ${sender}: "${text}"`);
 
-        // Check if there is an active queue for this user, and they replied with a confirmation text
-        const cleanText = text.toLowerCase().trim();
-        if (hasQueue(sender) && (cleanText === 'yes' || cleanText === 'no' || cleanText === 'y' || cleanText === 'n')) {
-          const queue = getQueue(sender);
-          if (queue && queue.length > 0) {
-            const currentItem = queue[0];
-            const isYes = cleanText === 'yes' || cleanText === 'y';
-            await handleQueueInteraction(sender, currentItem.courseCode, isYes, isSenderAdmin, messageId);
-            return;
-          }
-        }
-
         // Skip greetings
         if (isConversationalQuery(text)) {
           addLog('info', `Greeting detected, skipping file search for "${text}"`);
           // Fall through to AI
         } else {
-          // Extract all distinct course codes
-          const distinctCourses = extractDistinctCourseCodes(text);
+          // Smart extraction: "cs405 finale term files send kar do" → code=cs405, context=[final], exclude=[mid]
+          const { courseCode, contextTerms, excludeTerms } = extractSmartSearchParams(text);
+          addLog('info', `Extracted: code=${courseCode}, context=[${contextTerms}], exclude=[${excludeTerms}]`);
 
-          if (distinctCourses.length > 0) {
-            addLog('info', `Extracted courses from text: [${distinctCourses.join(', ')}]`);
-            const { contextTerms, excludeTerms } = extractSmartSearchParams(text);
+          if (courseCode) {
+            try {
+              // Search Supabase
+              let dbFiles = await getFilesByKeywords([courseCode], contextTerms);
+              if (!isSenderAdmin) {
+                dbFiles = dbFiles.filter(f => !isMidtermFile(f.filename) && isFinalTermFile(f.filename));
+              } else {
+                dbFiles = dbFiles.filter(f => !f.filename.toLowerCase().includes('midterm'));
+                // Apply exclusion filter: remove files whose name contains any excluded term
+                if (excludeTerms.length > 0) {
+                  const before = dbFiles.length;
+                  dbFiles = dbFiles.filter(f => !excludeTerms.some(ex => f.filename.toLowerCase().includes(ex)));
+                  if (before !== dbFiles.length) addLog('info', `Excluded ${before - dbFiles.length} DB midterm/final file(s)`);
+                }
+              }
+              addLog('info', `Supabase: ${dbFiles.length} files for "${courseCode}"`);
 
-            const queueItems: QueueItem[] = [];
+              // Search Google Drive
+              let driveFiles = await searchGDriveFiles(courseCode, contextTerms);
+              if (!isSenderAdmin) {
+                driveFiles = driveFiles.filter(f => !isMidtermFile(f.name) && isFinalTermFile(f.name));
+              } else {
+                driveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
+                // Apply exclusion filter: remove files whose name contains any excluded term
+                if (excludeTerms.length > 0) {
+                  const before = driveFiles.length;
+                  driveFiles = driveFiles.filter(f => !excludeTerms.some(ex => f.name.toLowerCase().includes(ex)));
+                  if (before !== driveFiles.length) addLog('info', `Excluded ${before - driveFiles.length} GDrive midterm/final file(s)`);
+                }
+              }
+              addLog('info', `GDrive: ${driveFiles.length} files for "${courseCode}"`);
 
-            for (const courseCode of distinctCourses) {
-              try {
-                // Search Supabase
-                let dbFiles = await getFilesByKeywords([courseCode], contextTerms);
-                if (!isSenderAdmin) {
-                  dbFiles = dbFiles.filter(f => !isMidtermFile(f.filename) && isFinalTermFile(f.filename));
-                } else {
-                  dbFiles = dbFiles.filter(f => !f.filename.toLowerCase().includes('midterm'));
-                  if (excludeTerms.length > 0) {
-                    dbFiles = dbFiles.filter(f => !excludeTerms.some(ex => f.filename.toLowerCase().includes(ex)));
+              const totalCount = dbFiles.length + driveFiles.length;
+              if (totalCount > 0) {
+                const contextLabel = contextTerms.length > 0 ? `(${contextTerms.join(', ')})` : '';
+                const excludeLabel = excludeTerms.length > 0 ? ` [excluding: ${excludeTerms.join(', ')}]` : '';
+                await sendAndLogTextMessage(sender, `Found ${totalCount} file(s) matching "${courseCode}" ${contextLabel}${excludeLabel}:`);
+
+                // Send files in parallel batches of 5 for throughput
+                const allFiles = [
+                  ...dbFiles.map(f => ({ source: 'db' as const, file: f })),
+                  ...driveFiles.map(f => ({ source: 'gdrive' as const, file: f })),
+                ];
+                for (const batch of chunk(allFiles, 5)) {
+                  // Check if user has sent a new message since this process started
+                  if (messageId && userLastMessageId.get(sender) !== messageId) {
+                    addLog('warn', `Aborted file sending for ${sender} because they sent a new message.`);
+                    return;
                   }
+                  await Promise.all(
+                    batch.map(async ({ source, file }) => {
+                      try {
+                        // Double check before sending each individual file in the batch
+                        if (messageId && userLastMessageId.get(sender) !== messageId) {
+                          return;
+                        }
+                        if (source === 'db') {
+                          await sendFileToUser(sender, file, isSenderAdmin);
+                        } else {
+                          await sendGDriveFileToUser(sender, file, isSenderAdmin);
+                        }
+                      } catch (err: any) {
+                        addLog('error', `Failed sending ${source} file: ${err.message}`);
+                      }
+                    })
+                  );
                 }
+                return;
+              }
 
-                // Search Google Drive
-                let driveFiles = await searchGDriveFiles(courseCode, contextTerms);
-                if (!isSenderAdmin) {
-                  driveFiles = driveFiles.filter(f => !isMidtermFile(f.name) && isFinalTermFile(f.name));
-                } else {
-                  driveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
-                  if (excludeTerms.length > 0) {
-                    driveFiles = driveFiles.filter(f => !excludeTerms.some(ex => f.name.toLowerCase().includes(ex)));
-                  }
-                }
+              addLog('warn', `No files found for "${courseCode}" [${contextTerms}]. Falling through to AI.`);
+            } catch (err: any) {
+              addLog('error', `Search error: ${err.message}`);
+            }
+          }
 
-                const totalCount = dbFiles.length + driveFiles.length;
-                if (totalCount > 0) {
-                  queueItems.push({
-                    courseCode,
-                    contextTerms,
-                    excludeTerms,
-                    totalCount,
-                    dbFiles,
-                    driveFiles
-                  });
+          // Short direct input check (filename, file ID)
+          const wordCount = text.split(/\s+/).length;
+          if (wordCount <= 4 && !isConversationalQuery(text)) {
+            const dbFile = await getFileByIdOrNameOrMessageId(text);
+            if (dbFile) {
+              const allowed = isSenderAdmin || (!isMidtermFile(dbFile.filename) && isFinalTermFile(dbFile.filename));
+              if (allowed) {
+                try {
+                  await sendAndLogTextMessage(sender, `Found file: ${dbFile.filename}`);
+                  await sendFileToUser(sender, dbFile, isSenderAdmin);
+                  return;
+                } catch (err: any) {
+                  addLog('error', `Direct file send error: ${err.message}`);
                 }
-              } catch (err: any) {
-                addLog('error', `Search setup error for "${courseCode}": ${err.message}`);
               }
             }
 
-            if (queueItems.length > 0) {
-              // Reset/Over-write the queue for this user
-              setQueue(sender, queueItems);
-              // Ask user for the first course
-              await askUserForFirstQueueItem(sender);
-              return;
+            const driveFiles = await searchGDriveFiles(text);
+            let filteredDriveFiles = driveFiles;
+            if (!isSenderAdmin) {
+              filteredDriveFiles = driveFiles.filter(f => !isMidtermFile(f.name) && isFinalTermFile(f.name));
+            } else {
+              filteredDriveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
             }
-
-            addLog('warn', `No files found for extracted courses: [${distinctCourses.join(', ')}]. Falling through to AI.`);
-          }
-        }
-
-        // Short direct input check (filename, file ID)
-        const wordCount = text.split(/\s+/).length;
-        if (wordCount <= 4 && !isConversationalQuery(text)) {
-          const dbFile = await getFileByIdOrNameOrMessageId(text);
-          if (dbFile) {
-            const allowed = isSenderAdmin || (!isMidtermFile(dbFile.filename) && isFinalTermFile(dbFile.filename));
-            if (allowed) {
+            if (filteredDriveFiles.length > 0) {
               try {
-                await sendAndLogTextMessage(sender, `Found file: ${dbFile.filename}`);
-                await sendFileToUser(sender, dbFile, isSenderAdmin);
+                await sendAndLogTextMessage(sender, `Found: ${filteredDriveFiles[0].name}`);
+                await sendGDriveFileToUser(sender, filteredDriveFiles[0], isSenderAdmin);
                 return;
               } catch (err: any) {
-                addLog('error', `Direct file send error: ${err.message}`);
+                addLog('error', `Direct GDrive send error: ${err.message}`);
               }
             }
           }
-
-          const driveFiles = await searchGDriveFiles(text);
-          let filteredDriveFiles = driveFiles;
-          if (!isSenderAdmin) {
-            filteredDriveFiles = driveFiles.filter(f => !isMidtermFile(f.name) && isFinalTermFile(f.name));
-          } else {
-            filteredDriveFiles = driveFiles.filter(f => !f.name.toLowerCase().includes('midterm'));
-          }
-          if (filteredDriveFiles.length > 0) {
-            try {
-              await sendAndLogTextMessage(sender, `Found: ${filteredDriveFiles[0].name}`);
-              await sendGDriveFileToUser(sender, filteredDriveFiles[0], isSenderAdmin);
-              return;
-            } catch (err: any) {
-              addLog('error', `Direct GDrive send error: ${err.message}`);
-            }
-          }
         }
-
 
         // AI fallback
         let intent;
