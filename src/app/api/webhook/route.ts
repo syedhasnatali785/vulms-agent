@@ -262,7 +262,8 @@ export async function POST(request: Request) {
         const text = message.text.body.trim();
         const savedMsg = await saveMessage(sender, text, 'incoming');
         const triggerMessageDbId = savedMsg?.id;
-        addLog('info', `← ${sender}: "${text}" (Db ID: ${triggerMessageDbId})`);
+        const triggerMessageCreatedAt = savedMsg?.created_at;
+        addLog('info', `← ${sender}: "${text}" (Db ID: ${triggerMessageDbId}, created_at: ${triggerMessageCreatedAt})`);
 
         // Skip greetings
         if (isConversationalQuery(text)) {
@@ -319,7 +320,7 @@ export async function POST(request: Request) {
                 for (const batch of chunk(allFiles, 5)) {
                   // 1. Database-backed cancellation check (works across PM2 clusters/servers)
                   if (triggerMessageDbId) {
-                    const hasNew = await hasUserSentNewMessage(sender, triggerMessageDbId);
+                    const hasNew = await hasUserSentNewMessage(sender, triggerMessageDbId, triggerMessageCreatedAt);
                     if (hasNew) {
                       addLog('warn', `Aborted file sending for ${sender} because they sent a new message (DB check).`);
                       return;
@@ -337,7 +338,7 @@ export async function POST(request: Request) {
                       try {
                         // Double check before sending each individual file
                         if (triggerMessageDbId) {
-                          const hasNew = await hasUserSentNewMessage(sender, triggerMessageDbId);
+                          const hasNew = await hasUserSentNewMessage(sender, triggerMessageDbId, triggerMessageCreatedAt);
                           if (hasNew) return;
                         }
                         if (messageId && userLastMessageId.get(sender) !== messageId) {

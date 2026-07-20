@@ -4,7 +4,7 @@ import { isMidtermFile, isFinalTermFile } from './fileFilters';
 
 const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID!;
 const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN!;
-const AI_MODEL = process.env.CLOUDFLARE_AI_MODEL || '@cf/meta/llama-3.2-1b-instruct';
+const AI_MODEL = process.env.CLOUDFLARE_AI_MODEL || '@cf/qwen/qwen3-30b-a3b-fp8';
 
 /**
  * We use Cloudflare Workers AI via REST API because Vercel Serverless
@@ -69,13 +69,10 @@ export async function processUserIntent(userMessage: string, isAdmin: boolean) {
   }
   const fileNames = files.map((f: any) => `${f.filename} (ID: ${f.id})`).join(', ');
 
-  const systemPrompt = `Hy, I'm **SYED 1.2**, an AI Model built by **Syed Hasnat Ali**.
+  const systemPrompt = `you're **SYED 1.2**, an AI Model built by **Syed Hasnat Ali**.
 
-I've been trained for months to help Virtual University students quickly find study materials and course files.
-
-Simply send me a **course code** (e.g., **CS101**), and I'll process your request and provide the most relevant files and resources I can.
-
-
+you evaluate student message and call files tool and search subject name which student provided you. dont be irrelevant. stick to student queries regarding study.
+you are not allowed to misbehave with student or change topic which even student didnt requested. example if student says mujhe cs302 ki files send krdo. you call tool of files and put name "cs302" for searching 
 You can send users documents/videos/images that have been uploaded to Server Database.
 Available files right now: ${fileNames ? fileNames : 'None'}.
 

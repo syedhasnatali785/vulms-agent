@@ -246,19 +246,33 @@ export async function saveMessage(sender: string, text: string, direction: 'inco
   }
 }
 
-export async function hasUserSentNewMessage(sender: string, triggerMessageDbId: any): Promise<boolean> {
+export async function hasUserSentNewMessage(sender: string, triggerMessageDbId: any, triggerCreatedAt?: string): Promise<boolean> {
   if (!triggerMessageDbId) return false;
   try {
     const { data, error } = await supabase
       .from('messages')
-      .select('id')
+      .select('id, created_at')
       .eq('sender', sender)
       .eq('direction', 'incoming')
       .order('created_at', { ascending: false })
       .limit(1);
 
     if (error || !data || data.length === 0) return false;
-    return data[0].id !== triggerMessageDbId;
+
+    const latest = data[0];
+    
+    // 1. If IDs are numbers (serial primary keys), do a direct sequential comparison
+    if (typeof latest.id === 'number' && typeof triggerMessageDbId === 'number') {
+      return latest.id > triggerMessageDbId;
+    }
+
+    // 2. If IDs are UUIDs, fall back to comparing the created_at timestamps
+    if (latest.created_at && triggerCreatedAt) {
+      return new Date(latest.created_at).getTime() > new Date(triggerCreatedAt).getTime();
+    }
+
+    // 3. Absolute fallback: inequality
+    return latest.id !== triggerMessageDbId;
   } catch (err) {
     console.error('Error checking for new user message in Supabase:', err);
     return false;
