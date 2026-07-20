@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractCourseKeywords, getFilesByKeywords, saveMessage, saveLog } from '@/lib/supabase';
+import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractCourseKeywords, getFilesByKeywords, saveMessage, saveLog, hasUserSentNewMessage } from '@/lib/supabase';
 import { downloadWhatsAppMedia, sendTextMessage, sendMediaMessage } from '@/lib/whatsapp';
 import { uploadFileToR2, getFileUrl } from '@/lib/r2';
 import { processUserIntent } from '@/lib/ai';
@@ -260,8 +260,9 @@ export async function POST(request: Request) {
       // 2. Handle Text Messages
       if (message.type === 'text') {
         const text = message.text.body.trim();
-        await saveMessage(sender, text, 'incoming');
-        addLog('info', `← ${sender}: "${text}"`);
+        const savedMsg = await saveMessage(sender, text, 'incoming');
+        const triggerMessageDbId = savedMsg?.id;
+        addLog('info', `← ${sender}: "${text}" (Db ID: ${triggerMessageDbId})`);
 
         // Skip greetings
         if (isConversationalQuery(text)) {
@@ -316,18 +317,33 @@ export async function POST(request: Request) {
                   ...driveFiles.map(f => ({ source: 'gdrive' as const, file: f })),
                 ];
                 for (const batch of chunk(allFiles, 5)) {
-                  // Check if user has sent a new message since this process started
+                  // 1. Database-backed cancellation check (works across PM2 clusters/servers)
+                  if (triggerMessageDbId) {
+                    const hasNew = await hasUserSentNewMessage(sender, triggerMessageDbId);
+                    if (hasNew) {
+                      addLog('warn', `Aborted file sending for ${sender} because they sent a new message (DB check).`);
+                      return;
+                    }
+                  }
+
+                  // 2. In-memory map fallback check (quick check for single process)
                   if (messageId && userLastMessageId.get(sender) !== messageId) {
-                    addLog('warn', `Aborted file sending for ${sender} because they sent a new message.`);
+                    addLog('warn', `Aborted file sending for ${sender} because they sent a new message (in-memory).`);
                     return;
                   }
+
                   await Promise.all(
                     batch.map(async ({ source, file }) => {
                       try {
-                        // Double check before sending each individual file in the batch
+                        // Double check before sending each individual file
+                        if (triggerMessageDbId) {
+                          const hasNew = await hasUserSentNewMessage(sender, triggerMessageDbId);
+                          if (hasNew) return;
+                        }
                         if (messageId && userLastMessageId.get(sender) !== messageId) {
                           return;
                         }
+
                         if (source === 'db') {
                           await sendFileToUser(sender, file, isSenderAdmin);
                         } else {

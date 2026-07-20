@@ -246,6 +246,25 @@ export async function saveMessage(sender: string, text: string, direction: 'inco
   }
 }
 
+export async function hasUserSentNewMessage(sender: string, triggerMessageDbId: any): Promise<boolean> {
+  if (!triggerMessageDbId) return false;
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .select('id')
+      .eq('sender', sender)
+      .eq('direction', 'incoming')
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    if (error || !data || data.length === 0) return false;
+    return data[0].id !== triggerMessageDbId;
+  } catch (err) {
+    console.error('Error checking for new user message in Supabase:', err);
+    return false;
+  }
+}
+
 export async function getMessages(limit = 100) {
   try {
     const { data, error } = await supabase
