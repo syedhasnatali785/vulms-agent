@@ -1,81 +1,42 @@
-import axios from 'axios';
-import { getAvailableFiles } from './supabase';
-import { isMidtermFile, isFinalTermFile } from './fileFilters';
+const axios = require('axios');
+const fs = require('fs');
 
-const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID!;
-const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN!;
-const AI_MODEL = process.env.CLOUDFLARE_AI_MODEL || '@cf/qwen/qwen3-30b-a3b-fp8';
+// Read .env.local manually
+let CLOUDFLARE_ACCOUNT_ID = '';
+let CLOUDFLARE_API_TOKEN = '';
+let AI_MODEL = '@cf/qwen/qwen3-30b-a3b-fp8'; // Default fallback
 
-/**
- * We use Cloudflare Workers AI via REST API because Vercel Serverless
- * does not support the native Cloudflare Workers bindings.
- */
-export async function runCloudflareAI(messages: any[]): Promise<string> {
-  const url = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${AI_MODEL}`;
-
-  try {
-    const response = await axios.post(
-      url,
-      { messages },
-      {
-        headers: {
-          Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 8000, // 8s timeout to stay within Vercel's 10s limit
+try {
+  const envContent = fs.readFileSync('.env.local', 'utf8');
+  const lines = envContent.split('\n');
+  for (const line of lines) {
+    const parts = line.trim().split('=');
+    if (parts.length >= 2) {
+      const key = parts[0].trim();
+      let val = parts.slice(1).join('=').trim();
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
       }
-    );
-
-    // Cloudflare can return 200 with { success: false, result: {}, errors: [...] }
-    const data = response.data;
-    if (!data?.success) {
-      console.error('Cloudflare AI returned unsuccessful response:', JSON.stringify(data));
-      throw new Error(`Cloudflare AI error: success=${data?.success}, errors=${JSON.stringify(data?.errors || [])}`);
+      if (key === 'CLOUDFLARE_ACCOUNT_ID') CLOUDFLARE_ACCOUNT_ID = val;
+      if (key === 'CLOUDFLARE_API_TOKEN') CLOUDFLARE_API_TOKEN = val;
+      if (key === 'CLOUDFLARE_AI_MODEL') AI_MODEL = val;
     }
-
-    // Try standard choices format first, then fall back to response field
-    const content = data?.result?.choices?.[0]?.message?.content ?? data?.result?.response;
-    if (content === undefined || content === null) {
-      console.error('Cloudflare AI did not return a response/content:', JSON.stringify(data));
-      throw new Error(`Cloudflare AI error: No response content found in result.`);
-    }
-
-    // Ensure content returned is a string
-    if (typeof content === 'object') {
-      return JSON.stringify(content);
-    }
-    return String(content);
-  } catch (error: any) {
-    const status = error.response?.status;
-    const errData = error.response?.data;
-    console.error(`Cloudflare AI error (status=${status}):`, errData || error.message);
-    throw new Error(`Cloudflare AI failed: status=${status}, message=${error.message}`);
   }
+} catch (e) {
+  console.error('Could not read .env.local', e);
 }
+console.log(`Loaded Account ID: ${CLOUDFLARE_ACCOUNT_ID ? 'YES' : 'NO'}`);
+console.log(`Loaded API Model: ${AI_MODEL}`);
 
-/**
- * Given a user's message, this function decides what the agent should do.
- * It injects the list of available files into the prompt.
- * 
- * Possible Intent Returns:
- * { type: 'chat', reply: '...message...' }
- * { type: 'send_file', filename: '...', reply: '...' }
- * { type: 'add_admin', newNumber: '...', reply: '...' }
- */
-export async function processUserIntent(userMessage: string, isAdmin: boolean, history: any[] = []) {
-  let files = await getAvailableFiles();
-  if (!isAdmin) {
-    files = files.filter((f: any) => !isMidtermFile(f.filename) && isFinalTermFile(f.filename));
-  }
-  const fileNames = files.map((f: any) => `${f.filename} (ID: ${f.id})`).join(', ');
-
+async function testUserIntent(userMessage, history = [], isAdmin = false) {
+  const fileNames = "cs302_handout.pdf (ID: 1), mth101_midterm.pdf (ID: 2), eng201_final_term.pdf (ID: 3)";
   const systemPrompt = `you're **SYED 1.2**, an AI Model built by **Syed Hasnat Ali**.
 
 you evaluate student messages and decide the appropriate action. Stick to student queries regarding study and materials. Do not be irrelevant.
 You can send users documents/videos/images that have been uploaded to our database or are available in our Google Drive directories.
 
 The user's role is: ${isAdmin ? 'ADMIN' : 'STANDARD USER'}.
-Available database files right now: ${fileNames ? fileNames : 'None'}.
+Available database files right now: ${fileNames}.
 
 ### OPERATIONAL WORKFLOW FOR FILE REQUESTS:
 Follow these steps in sequence when a student asks for files, handouts, or past papers:
@@ -144,22 +105,40 @@ Assistant Output:
 
 Output EXACTLY ONE valid JSON object conforming to one of the formats above. Do NOT output any introductory text, titles, markdown blocks, formatting headers, or multiple examples. Your output must start directly with '{' and end directly with '}'.`;
 
-  const historyMessages = history.map((msg: any) => ({
+  const url = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${AI_MODEL}`;
+  console.log(`\n--- Test User Message: "${userMessage}" ---`);
+  
+  const historyMessages = history.map(msg => ({
     role: msg.direction === 'incoming' ? 'user' : 'assistant',
     content: msg.text
   }));
 
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    ...historyMessages,
-    { role: 'user', content: userMessage }
-  ];
-
-  const aiResponse = await runCloudflareAI(messages);
-
+  let content = '';
   try {
-    let cleanResponse = aiResponse.trim();
-    // Resilient parsing: extract JSON block if wrapped in explanation or markdown prefix
+    const response = await axios.post(
+      url,
+      {
+        messages: [
+          { role: 'system', content: systemPrompt },
+          ...historyMessages,
+          { role: 'user', content: userMessage }
+        ]
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 10000,
+      }
+    );
+
+    const data = response.data;
+    content = data?.result?.choices?.[0]?.message?.content ?? data?.result?.response;
+    console.log("Raw Response:", content);
+
+    // Try parsing
+    let cleanResponse = content.trim();
     const firstBrace = cleanResponse.indexOf('{');
     const lastBrace = cleanResponse.lastIndexOf('}');
     if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
@@ -173,16 +152,28 @@ Output EXACTLY ONE valid JSON object conforming to one of the formats above. Do 
       }
     }
     const parsed = JSON.parse(cleanResponse);
-    if (parsed && typeof parsed === 'object') {
-      if (parsed.reply && typeof parsed.reply === 'object') {
-        parsed.reply = JSON.stringify(parsed.reply);
-      }
-      return parsed;
-    }
-    return { type: 'chat', reply: cleanResponse };
-  } catch (e) {
-    console.error("Failed to parse AI JSON response:", aiResponse);
-    const replyText = typeof aiResponse === 'object' ? JSON.stringify(aiResponse) : String(aiResponse || '');
-    return { type: 'chat', reply: replyText || "I didn't quite catch that. Can you rephrase?" };
+    console.log("Parsed JSON:", JSON.stringify(parsed, null, 2));
+    return parsed;
+  } catch (error) {
+    console.log("Fallback representation (if any text):", content);
+    console.error(`Failed to parse response as JSON: ${error.message}`);
+    return { type: 'chat', reply: content };
   }
 }
+
+async function main() {
+  console.log("=== SIMULATING MULTI-TURN CONVERSATION ===");
+  const history = [];
+
+  // Turn 1: User requests files for CS302. AI should not search, but ask questions first.
+  const msg1 = "give me cs302 files";
+  const res1 = await testUserIntent(msg1, history);
+  history.push({ direction: 'incoming', text: msg1 });
+  history.push({ direction: 'outgoing', text: res1.reply || JSON.stringify(res1) });
+
+  // Turn 2: User answers the AI questions and confirms. AI should now search.
+  const msg2 = "Yes please search, I want 3 final term papers for cs302";
+  const res2 = await testUserIntent(msg2, history);
+}
+
+main();

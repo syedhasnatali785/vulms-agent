@@ -298,6 +298,26 @@ export async function getMessages(limit = 100) {
   }
 }
 
+export async function getMessagesBySender(sender: string, limit = 10) {
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('sender', sender)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+      
+    if (error) {
+      console.error('Error fetching messages from Supabase by sender:', error);
+      return [];
+    }
+    return (data || []).reverse();
+  } catch (err) {
+    console.error('Exception fetching messages from Supabase by sender:', err);
+    return [];
+  }
+}
+
 export async function saveLog(level: 'info' | 'warn' | 'error', message: string) {
   try {
     const { error } = await supabase
