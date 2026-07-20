@@ -556,6 +556,65 @@ export async function POST(request: Request) {
             break;
           }
 
+          case 'keyword_search': {
+            // Broad keyword search — returns ALL matching files from DB (no Drive, no qty cap)
+            const rawKeywords: string[] = intent.keywords || [];
+            if (rawKeywords.length === 0) break;
+
+            // Expand each raw keyword into all format variants (eng201, ENG201, eng_201, …)
+            const { extractCourseKeywords: extractKW } = await import('@/lib/supabase');
+            const expandedKeywords: string[] = [];
+            const seenKW = new Set<string>();
+            for (const kw of rawKeywords) {
+              for (const variant of extractKW(kw)) {
+                if (!seenKW.has(variant)) { seenKW.add(variant); expandedKeywords.push(variant); }
+              }
+            }
+            // Fallback: if expansion produced nothing (e.g. plain word), use raw keywords
+            const finalKeywords = expandedKeywords.length > 0 ? expandedKeywords : rawKeywords;
+
+            await sendAndLogTextMessage(sender, intent.reply || `Keyword search chal rahi hai: ${rawKeywords.join(', ')}. Please wait...`);
+            addLog('info', `Keyword search: [${finalKeywords.join(', ')}]`);
+
+            let kwFiles = await getFilesByKeywords(finalKeywords);
+
+            // Apply role-based filter
+            kwFiles = kwFiles.filter((f: any) => {
+              return isSenderAdmin || (!isMidtermFile(f.filename) && isFinalTermFile(f.filename));
+            });
+
+            if (kwFiles.length === 0) {
+              await sendAndLogTextMessage(sender, `❌ Koi file nahi mili: "${rawKeywords.join(', ')}"`);
+              break;
+            }
+
+            await sendAndLogTextMessage(sender, `✅ ${kwFiles.length} file(s) mili hain. Bhej raha hoon...`);
+
+            for (const batch of chunk(kwFiles.map((f: any) => ({ source: 'db' as const, file: f, name: f.filename })), 5)) {
+              if (triggerMessageDbId) {
+                const hasNew = await hasUserSentNewMessage(sender, triggerMessageDbId, triggerMessageCreatedAt);
+                if (hasNew) { addLog('warn', `Aborted keyword send for ${sender} — new message detected.`); return; }
+              }
+              if (messageId && userLastMessageId.get(sender) !== messageId) return;
+
+              await Promise.all(
+                batch.map(async ({ file }) => {
+                  try {
+                    if (triggerMessageDbId) {
+                      const hasNew = await hasUserSentNewMessage(sender, triggerMessageDbId, triggerMessageCreatedAt);
+                      if (hasNew) return;
+                    }
+                    if (messageId && userLastMessageId.get(sender) !== messageId) return;
+                    await sendFileToUser(sender, file, isSenderAdmin);
+                  } catch (err: any) {
+                    addLog('error', `Failed sending keyword file: ${err.message}`);
+                  }
+                })
+              );
+            }
+            break;
+          }
+
           case 'chat':
           default:
             await sendAndLogTextMessage(sender, intent.reply || "Mujhe samajh nahi aaya. Course code likhein (jaise CS302).");

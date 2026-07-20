@@ -60,7 +60,8 @@ export async function runCloudflareAI(messages: any[]): Promise<string> {
  * Possible Intent Returns:
  * { type: 'chat', reply: '...' }
  * { type: 'send_file', search_query: '...', quantity: N, context_terms: [...], exclude_terms: [...], reply: '...' }
- * { type: 'send_files', searches: [{ search_query: '...', quantity: N, context_terms: [...], exclude_terms: [...] }], reply: '...' }
+ * { type: 'send_files', searches: [...], reply: '...' }
+ * { type: 'keyword_search', keywords: [...], reply: '...' }  ← broad DB keyword search, returns all matches
  * { type: 'add_admin', newNumber: '...', reply: '...' }
  */
 export async function processUserIntent(userMessage: string, isAdmin: boolean, history: any[] = []) {
@@ -123,6 +124,13 @@ Format 4: Add Admin (ADMIN users only)
   "reply": "<confirmation message>"
 }
 
+Format 5: Keyword Search Tool — Broad DB Search (use when student says "search all", "show everything", "har file do", or explicitly wants ALL available files for a topic without a quantity limit)
+{
+  "type": "keyword_search",
+  "keywords": ["<keyword1>", "<keyword2>"],
+  "reply": "<confirmation message>"
+}
+
 ### CONVERSATION EXAMPLES:
 
 Example 1: First single-course request (no prior confirmation in history)
@@ -167,6 +175,15 @@ Assistant Output:
 {
   "type": "chat",
   "reply": "Main theek hoon, shukriya! VU studies mein kaise help kar sakta hoon?"
+}
+
+Example 5: Student explicitly wants ALL files / broad search
+User: "cs302 ki sari files do" (or "show everything for cs302", "har file chahiye")
+Assistant Output:
+{
+  "type": "keyword_search",
+  "keywords": ["cs302"],
+  "reply": "CS302 ki tamam files search ho rahi hain, please wait..."
 }
 
 Output EXACTLY ONE valid JSON object. Do NOT add any text before or after the JSON. Start directly with '{' and end with '}'.`;
