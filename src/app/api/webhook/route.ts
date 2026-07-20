@@ -1,4 +1,6 @@
 import { NextResponse } from 'next/server';
+import fs from 'fs';
+import path from 'path';
 import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractCourseKeywords, getFilesByKeywords, saveMessage, saveLog } from '@/lib/supabase';
 import { downloadWhatsAppMedia, sendTextMessage, sendMediaMessage, sendInteractiveButtons } from '@/lib/whatsapp';
 import { uploadFileToR2, getFileUrl } from '@/lib/r2';
@@ -22,9 +24,6 @@ const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 const processedMessageIds = new Set<string>();
 const MAX_CACHE_SIZE = 1000;
 
-// Track the latest message ID processed for each user to cancel ongoing batch sends if they respond
-const userLastMessageId = new Map<string, string>();
-
 interface QueueItem {
   courseCode: string;
   contextTerms: string[];
@@ -34,8 +33,75 @@ interface QueueItem {
   driveFiles: any[];
 }
 
-// In-memory queue storage mapping user phone number to their list of pending course files to confirm/send
-const userQueues = new Map<string, QueueItem[]>();
+// Persist user queues and last message IDs in local JSON files to support multiple PM2 cluster processes
+const QUEUES_FILE = path.join(process.cwd(), 'user_queues.json');
+const LAST_MSG_FILE = path.join(process.cwd(), 'user_last_messages.json');
+
+function getQueue(sender: string): QueueItem[] {
+  try {
+    if (fs.existsSync(QUEUES_FILE)) {
+      const data = JSON.parse(fs.readFileSync(QUEUES_FILE, 'utf8') || '{}');
+      return data[sender] || [];
+    }
+  } catch (e) {
+    console.error('Error reading user_queues.json:', e);
+  }
+  return [];
+}
+
+function setQueue(sender: string, queue: QueueItem[]) {
+  try {
+    let data: any = {};
+    if (fs.existsSync(QUEUES_FILE)) {
+      data = JSON.parse(fs.readFileSync(QUEUES_FILE, 'utf8') || '{}');
+    }
+    data[sender] = queue;
+    fs.writeFileSync(QUEUES_FILE, JSON.stringify(data, null, 2), 'utf8');
+  } catch (e) {
+    console.error('Error writing user_queues.json:', e);
+  }
+}
+
+function deleteQueue(sender: string) {
+  try {
+    if (fs.existsSync(QUEUES_FILE)) {
+      const data = JSON.parse(fs.readFileSync(QUEUES_FILE, 'utf8') || '{}');
+      delete data[sender];
+      fs.writeFileSync(QUEUES_FILE, JSON.stringify(data, null, 2), 'utf8');
+    }
+  } catch (e) {
+    console.error('Error deleting queue:', e);
+  }
+}
+
+function hasQueue(sender: string): boolean {
+  return getQueue(sender).length > 0;
+}
+
+function getLastMessageId(sender: string): string {
+  try {
+    if (fs.existsSync(LAST_MSG_FILE)) {
+      const data = JSON.parse(fs.readFileSync(LAST_MSG_FILE, 'utf8') || '{}');
+      return data[sender] || '';
+    }
+  } catch (e) {
+    console.error('Error reading user_last_messages.json:', e);
+  }
+  return '';
+}
+
+function setLastMessageId(sender: string, messageId: string) {
+  try {
+    let data: any = {};
+    if (fs.existsSync(LAST_MSG_FILE)) {
+      data = JSON.parse(fs.readFileSync(LAST_MSG_FILE, 'utf8') || '{}');
+    }
+    data[sender] = messageId;
+    fs.writeFileSync(LAST_MSG_FILE, JSON.stringify(data, null, 2), 'utf8');
+  } catch (e) {
+    console.error('Error writing user_last_messages.json:', e);
+  }
+}
 
 function extractDistinctCourseCodes(text: string): string[] {
   const coursePattern = /\b([a-zA-Z]{2,5})\s*[-_]?\s*(\d{2,4})\b/gi;
@@ -48,9 +114,9 @@ function extractDistinctCourseCodes(text: string): string[] {
 }
 
 async function askUserForFirstQueueItem(sender: string) {
-  const queue = userQueues.get(sender);
+  const queue = getQueue(sender);
   if (!queue || queue.length === 0) {
-    userQueues.delete(sender);
+    deleteQueue(sender);
     return;
   }
   
@@ -72,10 +138,10 @@ async function askUserForFirstQueueItem(sender: string) {
 }
 
 async function handleQueueInteraction(sender: string, courseCode: string, isYes: boolean, isSenderAdmin: boolean, messageId?: string) {
-  const queue = userQueues.get(sender);
+  const queue = getQueue(sender);
   if (!queue || queue.length === 0) {
     addLog('warn', `Interaction received for user ${sender} but queue is empty.`);
-    userQueues.delete(sender);
+    deleteQueue(sender);
     return;
   }
   
@@ -87,7 +153,7 @@ async function handleQueueInteraction(sender: string, courseCode: string, isYes:
   
   // Remove the current item from the queue
   queue.shift();
-  userQueues.set(sender, queue);
+  setQueue(sender, queue);
   
   const courseUpper = courseCode.toUpperCase();
   
@@ -96,7 +162,7 @@ async function handleQueueInteraction(sender: string, courseCode: string, isYes:
     
     // Set userLastMessageId so any new text messages can cancel this send operation
     if (messageId) {
-      userLastMessageId.set(sender, messageId);
+      setLastMessageId(sender, messageId);
     }
     
     const allFiles = [
@@ -109,14 +175,14 @@ async function handleQueueInteraction(sender: string, courseCode: string, isYes:
       try {
         for (const batch of chunk(allFiles, 5)) {
           // Check if aborted
-          if (messageId && userLastMessageId.get(sender) !== messageId) {
+          if (messageId && getLastMessageId(sender) !== messageId) {
             addLog('warn', `Aborted file sending for ${sender} because they sent a new message.`);
             return;
           }
           await Promise.all(
             batch.map(async ({ source, file }) => {
               try {
-                if (messageId && userLastMessageId.get(sender) !== messageId) {
+                if (messageId && getLastMessageId(sender) !== messageId) {
                   return;
                 }
                 if (source === 'db') {
@@ -132,14 +198,14 @@ async function handleQueueInteraction(sender: string, courseCode: string, isYes:
         }
         
         // Check if there is still a queue and if it's the active session
-        const updatedQueue = userQueues.get(sender);
+        const updatedQueue = getQueue(sender);
         if (updatedQueue && updatedQueue.length > 0) {
           // Wait 2.5 seconds before prompting the next item so messages don't overlap too fast
           setTimeout(async () => {
             await askUserForFirstQueueItem(sender);
           }, 2500);
         } else {
-          userQueues.delete(sender);
+          deleteQueue(sender);
           await sendAndLogTextMessage(sender, `All files for ${courseUpper} sent successfully!`);
         }
       } catch (err: any) {
@@ -152,7 +218,7 @@ async function handleQueueInteraction(sender: string, courseCode: string, isYes:
     if (queue.length > 0) {
       await askUserForFirstQueueItem(sender);
     } else {
-      userQueues.delete(sender);
+      deleteQueue(sender);
       await sendAndLogTextMessage(sender, `Skipped sending files for ${courseUpper}. No more pending courses in queue.`);
     }
   }
@@ -337,7 +403,7 @@ export async function POST(request: Request) {
 
       const sender = message.from;
       if (messageId && sender) {
-        userLastMessageId.set(sender, messageId);
+        setLastMessageId(sender, messageId);
       }
       addLog('info', `← Message from ${sender}: type=${message.type}`);
 
@@ -417,8 +483,8 @@ export async function POST(request: Request) {
 
         // Check if there is an active queue for this user, and they replied with a confirmation text
         const cleanText = text.toLowerCase().trim();
-        if (userQueues.has(sender) && (cleanText === 'yes' || cleanText === 'no' || cleanText === 'y' || cleanText === 'n')) {
-          const queue = userQueues.get(sender);
+        if (hasQueue(sender) && (cleanText === 'yes' || cleanText === 'no' || cleanText === 'y' || cleanText === 'n')) {
+          const queue = getQueue(sender);
           if (queue && queue.length > 0) {
             const currentItem = queue[0];
             const isYes = cleanText === 'yes' || cleanText === 'y';
@@ -483,7 +549,7 @@ export async function POST(request: Request) {
 
             if (queueItems.length > 0) {
               // Reset/Over-write the queue for this user
-              userQueues.set(sender, queueItems);
+              setQueue(sender, queueItems);
               // Ask user for the first course
               await askUserForFirstQueueItem(sender);
               return;
