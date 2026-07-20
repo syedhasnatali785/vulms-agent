@@ -101,7 +101,7 @@ Format 2: Single Course File Search (one course confirmed)
 {
   "type": "send_file",
   "search_query": "<course code, e.g. 'cs302'>",
-  "quantity": <number of files, default 5>,
+  "quantity": <number of files requested by user (or 5 if unspecified)>,
   "context_terms": ["<e.g. 'final', 'handout'>"],
   "exclude_terms": ["<e.g. 'midterm'>"],
   "reply": "<short confirmation message>"

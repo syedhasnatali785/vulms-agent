@@ -323,7 +323,7 @@ export async function POST(request: Request) {
             break;
           case 'send_file':
             const searchQuery = intent.search_query || intent.filename || text;
-            const limitQuantity = Math.min(10, Math.max(1, parseInt(intent.quantity, 10) || 10));
+            const limitQuantity = Math.max(1, parseInt(intent.quantity, 10) || 5);
             const contextTerms: string[] = intent.context_terms || [];
             const excludeTerms: string[] = intent.exclude_terms || [];
 
@@ -459,7 +459,7 @@ export async function POST(request: Request) {
             const searchResults = await Promise.all(
               multiSearches.map(async (s) => {
                 const sq = s.search_query;
-                const qty = Math.min(10, Math.max(1, s.quantity || 10));
+                const qty = Math.max(1, s.quantity || 5);
                 const ctx: string[] = s.context_terms || [];
                 const excl: string[] = s.exclude_terms || [];
 
