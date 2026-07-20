@@ -36,8 +36,10 @@ const DRIVE_FOLDER_IDS = [
   '1AW5xcAeABpWu9ZNx8fCKDi6Eh1H-Yn50',
   '1Vj6_3QoLYZgRhl0ADVH9jbloQ2jDz-gG',
   '1e86UwiTdTO5uun4newSAn4YepBfIHj8o',
+  '1bOev2FOmP7cwqsmtcAyhgloqFB6Emvp9',
+  '1mM2fuhY0kvi5CuwLezbqriwZPTjmQzg7',
   '1i3v79NvfvB6-gCq1KgB-jwSLl3OoX9_O',
-  '1otdtBp0wTC9KseXTAG7lf35VGbrQjw3k'
+  '1otdtBp0wTC9KseXTAG7lf35VGbrQjw3k',
 ];
 
 export interface GDriveFile {
@@ -175,7 +177,7 @@ export async function searchGDriveFiles(query: string, contextTerms: string[] = 
   console.log(`[GDrive] Search "${query}" [${contextTerms}] → ${relevantFolders.length}/${allFolders.length} folders`);
 
   const escapedQuery = query.replace(/'/g, "\\'");
-  
+
   // Build the context term filters for the query string using OR grouping
   // Example: and (name contains 'finale' or name contains 'final')
   let contextFilters = '';
