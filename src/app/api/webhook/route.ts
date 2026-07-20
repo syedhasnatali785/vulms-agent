@@ -295,14 +295,14 @@ export async function POST(request: Request) {
           if (fallbackCodes.length > 1) {
             intent = {
               type: 'send_files',
-              searches: fallbackCodes.map(code => ({ search_query: code, quantity: 5, context_terms: [], exclude_terms: [] })),
+              searches: fallbackCodes.map(code => ({ search_query: code, quantity: 10, context_terms: [], exclude_terms: [] })),
               reply: `${fallbackCodes.length} courses ki files search ho rahi hain: ${fallbackCodes.join(', ')}. Please wait...`
             };
           } else if (fallbackCodes.length === 1) {
             intent = {
               type: 'send_file',
               search_query: fallbackCodes[0],
-              quantity: 5,
+              quantity: 10,
               context_terms: [],
               exclude_terms: [],
               reply: `${fallbackCodes[0]} ki files search ho rahi hain. Please wait...`
@@ -323,7 +323,7 @@ export async function POST(request: Request) {
             break;
           case 'send_file':
             const searchQuery = intent.search_query || intent.filename || text;
-            const limitQuantity = Math.max(1, parseInt(intent.quantity, 10) || 5);
+            const limitQuantity = Math.min(10, Math.max(1, parseInt(intent.quantity, 10) || 10));
             const contextTerms: string[] = intent.context_terms || [];
             const excludeTerms: string[] = intent.exclude_terms || [];
 
@@ -459,7 +459,7 @@ export async function POST(request: Request) {
             const searchResults = await Promise.all(
               multiSearches.map(async (s) => {
                 const sq = s.search_query;
-                const qty = Math.max(1, s.quantity || 5);
+                const qty = Math.min(10, Math.max(1, s.quantity || 10));
                 const ctx: string[] = s.context_terms || [];
                 const excl: string[] = s.exclude_terms || [];
 
