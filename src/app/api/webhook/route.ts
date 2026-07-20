@@ -22,6 +22,9 @@ const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 const processedMessageIds = new Set<string>();
 const MAX_CACHE_SIZE = 1000;
 
+// Track the latest message ID processed for each user to cancel ongoing batch sends if they respond
+const userLastMessageId = new Map<string, string>();
+
 function isDuplicateMessage(messageId: string): boolean {
   if (processedMessageIds.has(messageId)) return true;
   processedMessageIds.add(messageId);
@@ -200,6 +203,9 @@ export async function POST(request: Request) {
       if (messageId && isDuplicateMessage(messageId)) return;
 
       const sender = message.from;
+      if (messageId && sender) {
+        userLastMessageId.set(sender, messageId);
+      }
       addLog('info', `← Message from ${sender}: type=${message.type}`);
 
       const isSenderAdmin = await isAdmin(sender);
@@ -310,9 +316,18 @@ export async function POST(request: Request) {
                   ...driveFiles.map(f => ({ source: 'gdrive' as const, file: f })),
                 ];
                 for (const batch of chunk(allFiles, 5)) {
+                  // Check if user has sent a new message since this process started
+                  if (messageId && userLastMessageId.get(sender) !== messageId) {
+                    addLog('warn', `Aborted file sending for ${sender} because they sent a new message.`);
+                    return;
+                  }
                   await Promise.all(
                     batch.map(async ({ source, file }) => {
                       try {
+                        // Double check before sending each individual file in the batch
+                        if (messageId && userLastMessageId.get(sender) !== messageId) {
+                          return;
+                        }
                         if (source === 'db') {
                           await sendFileToUser(sender, file, isSenderAdmin);
                         } else {
