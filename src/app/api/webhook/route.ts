@@ -16,6 +16,22 @@ function chunk<T>(arr: T[], size: number): T[][] {
   );
 }
 
+/**
+ * Extract VU-style course codes from a freeform string.
+ * Matches patterns like CS302, MTH101, EDU 303, ENG201, etc.
+ */
+function extractCourseCodes(text: string): string[] {
+  const matches = text.match(/\b([A-Z]{2,4})\s*(\d{3,4}[A-Z]?)\b/gi) || [];
+  // Normalise to uppercase without spaces and deduplicate
+  const seen = new Set<string>();
+  const codes: string[] = [];
+  for (const m of matches) {
+    const normalised = m.replace(/\s+/g, '').toUpperCase();
+    if (!seen.has(normalised)) { seen.add(normalised); codes.push(normalised); }
+  }
+  return codes;
+}
+
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 
 // In-memory deduplication cache
@@ -273,7 +289,27 @@ export async function POST(request: Request) {
           addLog('info', `AI intent: ${intent.type}`);
         } catch (aiErr: any) {
           addLog('error', `AI error: ${aiErr.message}`);
-          intent = { type: 'chat', reply: "👋Welcome I'm SYED 1.2, an AI language model built by Syed Hasnat Ali 📚 Simply send me a course code (for example: CS101, MTH101, or ENG201), and I'll process your request and do my best to provide the relevant files and study materials. Just send your course code to get started!" };
+          // Smart fallback: if AI times out or fails, extract course codes from the
+          // user's message via regex and proceed to search directly.
+          const fallbackCodes = extractCourseCodes(text);
+          if (fallbackCodes.length > 1) {
+            intent = {
+              type: 'send_files',
+              searches: fallbackCodes.map(code => ({ search_query: code, quantity: 5, context_terms: [], exclude_terms: [] })),
+              reply: `${fallbackCodes.length} courses ki files search ho rahi hain: ${fallbackCodes.join(', ')}. Please wait...`
+            };
+          } else if (fallbackCodes.length === 1) {
+            intent = {
+              type: 'send_file',
+              search_query: fallbackCodes[0],
+              quantity: 5,
+              context_terms: [],
+              exclude_terms: [],
+              reply: `${fallbackCodes[0]} ki files search ho rahi hain. Please wait...`
+            };
+          } else {
+            intent = { type: 'chat', reply: 'Mujhe samajh nahi aaya. Please course code likhein (jaise CS302, MTH101).' };
+          }
         }
 
         switch (intent.type) {
@@ -406,12 +442,123 @@ export async function POST(request: Request) {
                 );
               }
             } else {
-              await sendAndLogTextMessage(sender, intent.reply || `Sorry, I couldn't find any files matching "${searchQuery}".`);
+              await sendAndLogTextMessage(sender, intent.reply || `Sorry, no files found for "${searchQuery}".`);
             }
             break;
+
+          case 'send_files': {
+            // Multiple courses — run all searches in parallel then send results sequentially
+            const multiSearches: Array<{ search_query: string; quantity: number; context_terms: string[]; exclude_terms: string[] }> =
+              intent.searches || [];
+
+            if (multiSearches.length === 0) break;
+
+            await sendAndLogTextMessage(sender, intent.reply || `${multiSearches.length} courses ki files search ho rahi hain. Please wait...`);
+
+            // Run all Google Drive + DB searches in parallel
+            const searchResults = await Promise.all(
+              multiSearches.map(async (s) => {
+                const sq = s.search_query;
+                const qty = Math.max(1, s.quantity || 5);
+                const ctx: string[] = s.context_terms || [];
+                const excl: string[] = s.exclude_terms || [];
+
+                let dbFiles: any[] = [];
+                const directDbFile = await getFileByIdOrNameOrMessageId(sq);
+                if (directDbFile) {
+                  const allowed = isSenderAdmin || (!isMidtermFile(directDbFile.filename) && isFinalTermFile(directDbFile.filename));
+                  if (allowed) dbFiles.push(directDbFile);
+                }
+                if (dbFiles.length < qty) {
+                  const kw = await getFilesByKeywords([sq], ctx);
+                  for (const f of kw) {
+                    if (dbFiles.some((e: any) => e.id === f.id)) continue;
+                    const allowed = isSenderAdmin || (!isMidtermFile(f.filename) && isFinalTermFile(f.filename));
+                    if (!allowed) continue;
+                    const nl = f.filename.toLowerCase();
+                    if (excl.some((ex: string) => nl.includes(ex.toLowerCase()))) continue;
+                    dbFiles.push(f);
+                  }
+                }
+
+                let driveFiles: any[] = [];
+                try {
+                  const raw = await searchGDriveFiles(sq, ctx);
+                  for (const f of raw) {
+                    const allowed = isSenderAdmin || (!isMidtermFile(f.name) && isFinalTermFile(f.name));
+                    if (!allowed) continue;
+                    const nl = f.name.toLowerCase();
+                    if (excl.some((ex: string) => nl.includes(ex.toLowerCase()))) continue;
+                    driveFiles.push(f);
+                  }
+                } catch (err: any) {
+                  addLog('error', `GDrive search error for "${sq}": ${err.message}`);
+                }
+
+                const seen = new Set<string>();
+                const merged: { source: 'db' | 'gdrive'; file: any; name: string }[] = [];
+                for (const f of dbFiles) {
+                  const nl = f.filename.toLowerCase();
+                  if (!seen.has(nl)) { seen.add(nl); merged.push({ source: 'db', file: f, name: f.filename }); }
+                }
+                for (const f of driveFiles) {
+                  const nl = f.name.toLowerCase();
+                  if (!seen.has(nl)) { seen.add(nl); merged.push({ source: 'gdrive', file: f, name: f.name }); }
+                }
+
+                return { query: sq, files: merged.slice(0, qty) };
+              })
+            );
+
+            // Send results course-by-course
+            for (const { query, files } of searchResults) {
+              // Cancellation check between courses
+              if (triggerMessageDbId) {
+                const hasNew = await hasUserSentNewMessage(sender, triggerMessageDbId, triggerMessageCreatedAt);
+                if (hasNew) { addLog('warn', `Aborted multi-send for ${sender} — new message detected.`); return; }
+              }
+              if (messageId && userLastMessageId.get(sender) !== messageId) return;
+
+              if (files.length === 0) {
+                await sendAndLogTextMessage(sender, `❌ "${query}" ke liye koi file nahi mili.`);
+                continue;
+              }
+
+              await sendAndLogTextMessage(sender, `📂 *${query.toUpperCase()}* — ${files.length} file(s):`);
+
+              for (const batch of chunk(files, 5)) {
+                if (triggerMessageDbId) {
+                  const hasNew = await hasUserSentNewMessage(sender, triggerMessageDbId, triggerMessageCreatedAt);
+                  if (hasNew) return;
+                }
+                if (messageId && userLastMessageId.get(sender) !== messageId) return;
+
+                await Promise.all(
+                  batch.map(async ({ source, file }) => {
+                    try {
+                      if (triggerMessageDbId) {
+                        const hasNew = await hasUserSentNewMessage(sender, triggerMessageDbId, triggerMessageCreatedAt);
+                        if (hasNew) return;
+                      }
+                      if (messageId && userLastMessageId.get(sender) !== messageId) return;
+                      if (source === 'db') {
+                        await sendFileToUser(sender, file, isSenderAdmin);
+                      } else {
+                        await sendGDriveFileToUser(sender, file, isSenderAdmin);
+                      }
+                    } catch (err: any) {
+                      addLog('error', `Failed sending ${source} file for "${query}": ${err.message}`);
+                    }
+                  })
+                );
+              }
+            }
+            break;
+          }
+
           case 'chat':
           default:
-            await sendAndLogTextMessage(sender, intent.reply || "I'm not sure how to help with that.");
+            await sendAndLogTextMessage(sender, intent.reply || "Mujhe samajh nahi aaya. Course code likhein (jaise CS302).");
             break;
         }
       }
