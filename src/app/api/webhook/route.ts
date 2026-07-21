@@ -457,7 +457,7 @@ export async function POST(request: Request) {
                 );
               }
             } else {
-              await sendAndLogTextMessage(sender, intent.reply || `Sorry, no files found for "${searchQuery}".`);
+              await sendAndLogTextMessage(sender, `❌ "${searchQuery}" ke liye koi file nahi mili.`);
             }
             break;
 
