@@ -156,12 +156,7 @@ async function sendAndLogTextMessage(to: string, text: string) {
 }
 
 async function sendFileToUser(sender: string, file: any, isSenderAdmin: boolean) {
-  if (!isSenderAdmin) {
-    if (isMidtermFile(file.filename) || !isFinalTermFile(file.filename)) {
-      addLog('warn', `Blocked sending file "${file.filename}" because it is not a final term file`);
-      return;
-    }
-  }
+  // DB files are uploaded by admins, so standard users should be allowed to receive them on demand.
   const fileUrl = await getFileUrl(file.r2_key);
   const mediaType = file.mime_type.startsWith('image') ? 'image'
     : file.mime_type.startsWith('video') ? 'video'
@@ -227,27 +222,73 @@ export async function POST(request: Request) {
       const isSenderAdmin = await isAdmin(sender);
       const MEDIA_TYPES = ['image', 'video', 'document', 'audio', 'voice', 'sticker'];
 
-      // 1. Handle Media Input (File uploads to server disabled — read title/caption only)
+      // 1. Handle Media Input
       if (MEDIA_TYPES.includes(message.type)) {
-        const caption = message[message.type]?.caption || '';
+        const mediaObj = message[message.type];
+        const caption = mediaObj?.caption || '';
         const rawFilename = (message.type === 'document' && message.document?.filename)
           ? message.document.filename
-          : (message[message.type]?.filename || '');
+          : (mediaObj?.filename || '');
 
-        let mediaTitle = rawFilename || caption;
-        if (rawFilename && caption && rawFilename !== caption) {
-          mediaTitle = `${rawFilename} ${caption}`;
-        }
-        mediaTitle = mediaTitle.trim();
+        if (isSenderAdmin) {
+          addLog('info', `Media received from admin ${sender}. Saving to Private Database...`);
+          try {
+            const mediaId = mediaObj?.id;
+            if (!mediaId) {
+              throw new Error('No media ID found in message payload.');
+            }
+            await sendAndLogTextMessage(sender, "📥 Processing and uploading your file. Please wait...");
 
-        if (mediaTitle) {
-          addLog('info', `Media received from ${sender} (saving disabled). Reading title/caption: "${mediaTitle}"`);
-          message.type = 'text';
-          message.text = { body: mediaTitle };
-        } else {
-          addLog('info', `Media received from ${sender} without title/caption (saving disabled).`);
-          await sendAndLogTextMessage(sender, "Media file uploads are disabled. Please send a text message with your course code or study query.");
+            const { buffer, mimeType } = await downloadWhatsAppMedia(mediaId);
+
+            let filename = rawFilename || caption;
+            if (!filename) {
+              const ext = mimeType.split('/')[1]?.split(';')[0] || 'bin';
+              filename = `${mediaId}.${ext}`;
+            } else {
+              filename = filename.trim();
+              const expectedExt = mimeType.split('/')[1]?.split(';')[0] || '';
+              if (expectedExt && !filename.toLowerCase().endsWith(`.${expectedExt.toLowerCase()}`)) {
+                const hasExtension = /\.[a-zA-Z0-9]{2,4}$/.test(filename);
+                if (!hasExtension) {
+                  filename = `${filename}.${expectedExt}`;
+                }
+              }
+            }
+
+            // Sanitize filename from directory traversal slashes
+            const sanitizedFilename = filename.replace(/[\/\\]/g, '_');
+            const r2Key = `uploads/${messageId || Date.now()}_${sanitizedFilename}`;
+            await uploadFileToR2(r2Key, buffer, mimeType);
+            const fileRecord = await saveFileMetadata(sanitizedFilename, r2Key, mimeType, sender, messageId);
+
+            if (fileRecord) {
+              await sendAndLogTextMessage(sender, `✅ File "${sanitizedFilename}" saved successfully to and database (ID: ${fileRecord.id}).`);
+            } else {
+              await sendAndLogTextMessage(sender, `⚠️ File "${sanitizedFilename}" uploaded to Database, but failed to save metadata in the database.`);
+            }
+          } catch (err: any) {
+            addLog('error', `Failed to process admin file upload: ${err.message}`);
+            await sendAndLogTextMessage(sender, `❌ Error processing file upload: ${err.message}`);
+          }
           return;
+        } else {
+          // Standard user sending file -> only read their name/caption and search
+          let mediaTitle = rawFilename || caption;
+          if (rawFilename && caption && rawFilename !== caption) {
+            mediaTitle = `${rawFilename} ${caption}`;
+          }
+          mediaTitle = mediaTitle.trim();
+
+          if (mediaTitle) {
+            addLog('info', `Media received from standard user ${sender}. Reading title/caption: "${mediaTitle}"`);
+            message.type = 'text';
+            message.text = { body: mediaTitle };
+          } else {
+            addLog('info', `Media received from standard user ${sender} without title/caption.`);
+            await sendAndLogTextMessage(sender, "Please send a file with a name/caption, or send a text message with your course code (e.g. CS302) to search for files.");
+            return;
+          }
         }
       }
 
@@ -348,20 +389,16 @@ export async function POST(request: Request) {
             // 1. Try to fetch direct file by ID or specific filename/message ID first
             const directDbFile = await getFileByIdOrNameOrMessageId(searchQuery);
             if (directDbFile) {
-              const allowed = isSenderAdmin || (!isMidtermFile(directDbFile.filename) && isFinalTermFile(directDbFile.filename));
-              if (allowed) {
-                dbFiles.push(directDbFile);
-              }
+              // Standard users can receive DB/R2 files when requested
+              dbFiles.push(directDbFile);
             }
 
             // 2. Search database by keywords/course code if not found or if we want more files
             if (dbFiles.length < limitQuantity) {
               let keywordDbFiles = await getFilesByKeywords([searchQuery], contextTerms);
-              // Filter out duplicate files and filter by midterm/final role restriction
+              // Filter out duplicate files
               for (const f of keywordDbFiles) {
                 if (dbFiles.some(existing => existing.id === f.id)) continue;
-                const allowed = isSenderAdmin || (!isMidtermFile(f.filename) && isFinalTermFile(f.filename));
-                if (!allowed) continue;
 
                 // Apply exclusion filter
                 const nameLower = f.filename.toLowerCase();
@@ -386,7 +423,7 @@ export async function POST(request: Request) {
                 driveFiles.push(f);
               }
             } catch (err: any) {
-              addLog('error', `GDrive search error: ${err.message}`);
+              addLog('error', `DB search error: ${err.message}`);
             }
 
             // Merge and deduplicate DB & Drive files by name
@@ -457,7 +494,7 @@ export async function POST(request: Request) {
                 );
               }
             } else {
-              await sendAndLogTextMessage(sender, `❌ "${searchQuery}" ke liye koi file nahi mili.`);
+              await sendAndLogTextMessage(sender, intent.reply || `Sorry, no files found for "${searchQuery}".`);
             }
             break;
 
@@ -481,15 +518,12 @@ export async function POST(request: Request) {
                 let dbFiles: any[] = [];
                 const directDbFile = await getFileByIdOrNameOrMessageId(sq);
                 if (directDbFile) {
-                  const allowed = isSenderAdmin || (!isMidtermFile(directDbFile.filename) && isFinalTermFile(directDbFile.filename));
-                  if (allowed) dbFiles.push(directDbFile);
+                  dbFiles.push(directDbFile);
                 }
                 if (dbFiles.length < qty) {
                   const kw = await getFilesByKeywords([sq], ctx);
                   for (const f of kw) {
                     if (dbFiles.some((e: any) => e.id === f.id)) continue;
-                    const allowed = isSenderAdmin || (!isMidtermFile(f.filename) && isFinalTermFile(f.filename));
-                    if (!allowed) continue;
                     const nl = f.filename.toLowerCase();
                     if (excl.some((ex: string) => nl.includes(ex.toLowerCase()))) continue;
                     dbFiles.push(f);
@@ -592,11 +626,6 @@ export async function POST(request: Request) {
             addLog('info', `Keyword search: [${finalKeywords.join(', ')}]`);
 
             let kwFiles = await getFilesByKeywords(finalKeywords);
-
-            // Apply role-based filter
-            kwFiles = kwFiles.filter((f: any) => {
-              return isSenderAdmin || (!isMidtermFile(f.filename) && isFinalTermFile(f.filename));
-            });
 
             if (kwFiles.length === 0) {
               await sendAndLogTextMessage(sender, `❌ Koi file nahi mili: "${rawKeywords.join(', ')}"`);
