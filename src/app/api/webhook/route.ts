@@ -281,34 +281,71 @@ export async function POST(request: Request) {
         const triggerMessageCreatedAt = savedMsg?.created_at;
         addLog('info', `← ${sender}: "${text}" (Db ID: ${triggerMessageDbId}, created_at: ${triggerMessageCreatedAt})`);
 
-        // AI processing handles all messages now
+        // AI processing handles messages, unless @all bypass is requested
         let intent;
-        try {
-          const history = await getMessagesBySender(sender, 10);
-          intent = await processUserIntent(text, isSenderAdmin, history);
-          addLog('info', `AI intent: ${intent.type}`);
-        } catch (aiErr: any) {
-          addLog('error', `AI error: ${aiErr.message}`);
-          // Smart fallback: if AI times out or fails, extract course codes from the
-          // user's message via regex and proceed to search directly.
-          const fallbackCodes = extractCourseCodes(text);
-          if (fallbackCodes.length > 1) {
+        if (text.toLowerCase().includes('@all')) {
+          addLog('info', `@all keyword detected in message: "${text}" - bypassing AI for direct search`);
+          const queryClean = text.replace(/@all/gi, '').trim();
+          const codes = extractCourseCodes(queryClean);
+
+          if (codes.length > 1) {
             intent = {
               type: 'send_files',
-              searches: fallbackCodes.map(code => ({ search_query: code, quantity: 10, context_terms: [], exclude_terms: [] })),
-              reply: `${fallbackCodes.length} courses ki files search ho rahi hain: ${fallbackCodes.join(', ')}. Please wait...`
+              searches: codes.map(code => ({ search_query: code, quantity: 999, context_terms: [], exclude_terms: [] })),
+              reply: `🔍 Direct search (@all): ${codes.length} courses ki tamam files search ho rahi hain (${codes.join(', ')})...`
             };
-          } else if (fallbackCodes.length === 1) {
+          } else if (codes.length === 1) {
             intent = {
               type: 'send_file',
-              search_query: fallbackCodes[0],
-              quantity: 10,
+              search_query: codes[0],
+              quantity: 999,
               context_terms: [],
               exclude_terms: [],
-              reply: `${fallbackCodes[0]} ki files search ho rahi hain. Please wait...`
+              reply: `🔍 Direct search (@all): ${codes[0]} ki tamam files search ho rahi hain...`
+            };
+          } else if (queryClean.length > 0) {
+            intent = {
+              type: 'send_file',
+              search_query: queryClean,
+              quantity: 999,
+              context_terms: [],
+              exclude_terms: [],
+              reply: `🔍 Direct search (@all): "${queryClean}" ki tamam files search ho rahi hain...`
             };
           } else {
-            intent = { type: 'chat', reply: 'Mujhe samajh nahi aaya. Please course code likhein (jaise CS302, MTH101).' };
+            intent = {
+              type: 'chat',
+              reply: 'Please @all ke saath subject code likhein (e.g. @all CS302).'
+            };
+          }
+        } else {
+          try {
+            const history = await getMessagesBySender(sender, 10);
+            intent = await processUserIntent(text, isSenderAdmin, history);
+            addLog('info', `AI intent: ${intent.type}`);
+          } catch (aiErr: any) {
+            addLog('error', `AI error: ${aiErr.message}`);
+            // Smart fallback: if AI times out or fails, extract course codes from the
+            // user's message via regex and proceed to search directly.
+            const fallbackCodes = extractCourseCodes(text);
+            if (fallbackCodes.length > 1) {
+              intent = {
+                type: 'send_files',
+                searches: fallbackCodes.map(code => ({ search_query: code, quantity: 10, context_terms: [], exclude_terms: [] })),
+                reply: `${fallbackCodes.length} courses ki files search ho rahi hain: ${fallbackCodes.join(', ')}. Please wait...`
+              };
+            } else if (fallbackCodes.length === 1) {
+              intent = {
+                type: 'send_file',
+                search_query: fallbackCodes[0],
+                quantity: 10,
+                context_terms: [],
+                exclude_terms: [],
+                reply: `${fallbackCodes[0]} ki files search ho rahi hain. Please wait...`
+              };
+            } else {
+              intent = { type: 'chat', reply: 'Mujhe samajh nahi aaya. Please course code likhein (jaise CS302, MTH101).' };
+            }
           }
         }
 
