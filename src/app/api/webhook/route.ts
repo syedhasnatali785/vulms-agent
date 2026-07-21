@@ -1,8 +1,8 @@
 import { NextResponse } from 'next/server';
 import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractCourseKeywords, getFilesByKeywords, saveMessage, saveLog, hasUserSentNewMessage, getMessagesBySender } from '@/lib/supabase';
 import { downloadWhatsAppMedia, sendTextMessage, sendMediaMessage } from '@/lib/whatsapp';
-import { uploadFileToR2, getFileUrl } from '@/lib/r2';
-import { processUserIntent } from '@/lib/ai';
+import { uploadFileToR2, getFileUrl, downloadFileContentFromR2 } from '@/lib/r2';
+import { processUserIntent, classifyAdminReview } from '@/lib/ai';
 import { searchGDriveFiles } from '@/lib/gdrive';
 import { isMidtermFile, isFinalTermFile } from '@/lib/fileFilters';
 
@@ -156,6 +156,30 @@ async function sendAndLogTextMessage(to: string, text: string) {
 }
 
 async function sendFileToUser(sender: string, file: any, isSenderAdmin: boolean) {
+  // Plain-text reviews are stored as text/plain — send content as a WhatsApp text
+  // message instead of a document attachment so students receive readable text.
+  if (file.mime_type && file.mime_type.startsWith('text/plain')) {
+    try {
+      const content = await downloadFileContentFromR2(file.r2_key);
+      const header = `📋 *Current Paper Review — ${file.filename.replace(/_/g, ' ').replace(/\.txt$/i, '')}*\n\n`;
+      // WhatsApp has a ~4096 char limit per message; chunk if needed
+      const fullText = header + content;
+      const MAX_CHUNK = 3800;
+      if (fullText.length <= MAX_CHUNK) {
+        await sendTextMessage(sender, fullText);
+      } else {
+        for (let i = 0; i < fullText.length; i += MAX_CHUNK) {
+          await sendTextMessage(sender, fullText.slice(i, i + MAX_CHUNK));
+        }
+      }
+      addLog('info', `→ Sent review text "${file.filename}" to ${sender}`);
+      return;
+    } catch (err: any) {
+      addLog('error', `Failed to read review content for "${file.filename}": ${err.message}`);
+      // Fall through to send as document if download fails
+    }
+  }
+
   // DB files are uploaded by admins, so standard users should be allowed to receive them on demand.
   const fileUrl = await getFileUrl(file.r2_key);
   const mediaType = file.mime_type.startsWith('image') ? 'image'
@@ -300,30 +324,36 @@ export async function POST(request: Request) {
         const triggerMessageCreatedAt = savedMsg?.created_at;
         addLog('info', `← ${sender}: "${text}" (Db ID: ${triggerMessageDbId}, created_at: ${triggerMessageCreatedAt})`);
 
-        // Check if admin is sending a Current Paper Review to save
-        if (isSenderAdmin) {
-          const codes = extractCourseCodes(text);
+        // Check if admin is sending a Current Paper Review to save (AI-verified)
+        if (isSenderAdmin && text.length > 30) {
           const lowerText = text.toLowerCase();
-          const isReviewKeyword = /review|current\s*paper|today.*paper|mcq|subjective|questions|exam/i.test(lowerText);
-          if (codes.length > 0 && isReviewKeyword && text.length > 30) {
-            addLog('info', `Text review received from admin ${sender} for ${codes.join(', ')}. Saving to R2 & DB...`);
-            try {
-              await sendAndLogTextMessage(sender, `📥 Saving current paper review for ${codes.join(', ')}...`);
-              const buffer = Buffer.from(text, 'utf-8');
-              const mimeType = 'text/plain; charset=utf-8';
-              for (const code of codes) {
-                // Generate a unique filename using timestamp and message ID to allow multiple reviews per course
-                const filename = `${code}_Current_Paper_Review_${messageId || Date.now()}.txt`;
-                const r2Key = `reviews/${code}_Current_Paper_Review_${messageId || Date.now()}.txt`;
-                await uploadFileToR2(r2Key, buffer, mimeType);
-                await saveFileMetadata(filename, r2Key, mimeType, sender, messageId);
+          // Quick pre-filter: only bother calling AI if the text looks vaguely review-like
+          const mightBeReview = /review|current\s*paper|today.*paper|mcq|subjective|questions|exam|aaya|aa gaya|aya/i.test(lowerText);
+          if (mightBeReview) {
+            addLog('info', `Possible review from admin ${sender}. Asking AI to classify...`);
+            const classification = await classifyAdminReview(text);
+            addLog('info', `AI review classification: is_review=${classification.is_review}, codes=${classification.course_codes.join(',')}, reason=${classification.reason}`);
+
+            if (classification.is_review && classification.course_codes.length > 0) {
+              try {
+                await sendAndLogTextMessage(sender, `📥 AI confirmed this is a paper review for ${classification.course_codes.join(', ')}. Saving...`);
+                const buffer = Buffer.from(text, 'utf-8');
+                const mimeType = 'text/plain; charset=utf-8';
+                for (const code of classification.course_codes) {
+                  const ts = messageId || Date.now();
+                  const filename = `${code}_Current_Paper_Review_${ts}.txt`;
+                  const r2Key = `reviews/${code}_Current_Paper_Review_${ts}.txt`;
+                  await uploadFileToR2(r2Key, buffer, mimeType);
+                  await saveFileMetadata(filename, r2Key, mimeType, sender, messageId);
+                }
+                await sendAndLogTextMessage(sender, `✅ Paper review for ${classification.course_codes.join(', ')} saved to Cloudflare R2 and database.`);
+              } catch (err: any) {
+                addLog('error', `Failed to save admin review: ${err.message}`);
+                await sendAndLogTextMessage(sender, `❌ Error saving your review: ${err.message}`);
               }
-              await sendAndLogTextMessage(sender, `✅ Current paper review for ${codes.join(', ')} saved successfully to Cloudflare R2 and database.`);
-            } catch (err: any) {
-              addLog('error', `Failed to save admin review: ${err.message}`);
-              await sendAndLogTextMessage(sender, `❌ Error saving your review: ${err.message}`);
+              return; // Stop — do not process as a file/chat request
             }
-            return; // Exit early to prevent treating it as a search request
+            // AI said it is NOT a review — fall through to normal intent processing
           }
         }
 

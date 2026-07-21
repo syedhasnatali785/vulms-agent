@@ -230,3 +230,53 @@ Output EXACTLY ONE valid JSON object. Do NOT add any text before or after the JS
     return { type: 'chat', reply: replyText || 'Mujhe samajh nahi aaya, please dobara try karein.' };
   }
 }
+
+/**
+ * Asks the AI to determine whether an admin's text message is a "Paper Current Review" —
+ * i.e. a description / report of questions that appeared in an actual exam.
+ *
+ * Returns:
+ *   { is_review: boolean, course_codes: string[], reason: string }
+ */
+export async function classifyAdminReview(
+  text: string
+): Promise<{ is_review: boolean; course_codes: string[]; reason: string }> {
+  const systemPrompt = `You are a strict classifier for a university study-material bot.
+Your ONLY job is to decide whether the admin's text message is a "Current Paper Review" — meaning it describes, summarises, or reports questions / MCQs / topics that appeared in a real university exam paper.
+
+Rules:
+- Treat it as a review ONLY if the message clearly discusses exam questions, MCQs, topics that were asked, or the difficulty of a specific exam.
+- If the message is a general command, greeting, question, admin instruction, or anything else — it is NOT a review.
+- Course codes look like CS302, MTH101, ENG201, etc. Extract ALL course codes mentioned.
+
+Reply with EXACTLY ONE valid JSON object — no extra text:
+{
+  "is_review": true | false,
+  "course_codes": ["CS302"],   // list of detected course codes, empty array if none
+  "reason": "brief one-line reason"
+}`;
+
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: text }
+  ];
+
+  try {
+    const raw = await runCloudflareAI(messages);
+    let clean = raw.trim();
+    const f = clean.indexOf('{');
+    const l = clean.lastIndexOf('}');
+    if (f !== -1 && l > f) clean = clean.slice(f, l + 1);
+    const parsed = JSON.parse(clean);
+    return {
+      is_review: parsed.is_review === true,
+      course_codes: Array.isArray(parsed.course_codes) ? parsed.course_codes : [],
+      reason: parsed.reason || '',
+    };
+  } catch (err) {
+    console.error('classifyAdminReview: Failed to parse AI response:', err);
+    // Conservative fallback: do not save if AI is uncertain
+    return { is_review: false, course_codes: [], reason: 'AI classification failed' };
+  }
+}
+

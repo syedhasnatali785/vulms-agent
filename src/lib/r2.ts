@@ -1,4 +1,4 @@
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand, GetObjectCommandOutput } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const accountId = process.env.R2_ACCOUNT_ID!;
@@ -47,3 +47,41 @@ export async function getFileUrl(key: string): Promise<string> {
   }
   return await getSignedDownloadUrl(key);
 }
+
+/**
+ * Downloads the raw content of an R2 object and returns it as a UTF-8 string.
+ * Used to read plain-text review files so they can be forwarded as WhatsApp
+ * text messages instead of document attachments.
+ */
+export async function downloadFileContentFromR2(key: string): Promise<string> {
+  const command = new GetObjectCommand({
+    Bucket: bucketName,
+    Key: key,
+  });
+
+  const response: GetObjectCommandOutput = await r2.send(command);
+
+  if (!response.Body) {
+    throw new Error(`R2 object "${key}" returned an empty body.`);
+  }
+
+  // response.Body is a ReadableStream in Node; collect chunks into a Buffer
+  const chunks: Uint8Array[] = [];
+  const stream = response.Body as any; // NodeJS.ReadableStream or Web ReadableStream
+  if (typeof stream[Symbol.asyncIterator] === 'function') {
+    for await (const chunk of stream) {
+      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+    }
+  } else {
+    // Web ReadableStream fallback
+    const reader = stream.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) chunks.push(value);
+    }
+  }
+
+  return Buffer.concat(chunks).toString('utf-8');
+}
+
