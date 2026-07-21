@@ -300,6 +300,33 @@ export async function POST(request: Request) {
         const triggerMessageCreatedAt = savedMsg?.created_at;
         addLog('info', `← ${sender}: "${text}" (Db ID: ${triggerMessageDbId}, created_at: ${triggerMessageCreatedAt})`);
 
+        // Check if admin is sending a Current Paper Review to save
+        if (isSenderAdmin) {
+          const codes = extractCourseCodes(text);
+          const lowerText = text.toLowerCase();
+          const isReviewKeyword = /review|current\s*paper|today.*paper|mcq|subjective|questions|exam/i.test(lowerText);
+          if (codes.length > 0 && isReviewKeyword && text.length > 30) {
+            addLog('info', `Text review received from admin ${sender} for ${codes.join(', ')}. Saving to R2 & DB...`);
+            try {
+              await sendAndLogTextMessage(sender, `📥 Saving current paper review for ${codes.join(', ')}...`);
+              const buffer = Buffer.from(text, 'utf-8');
+              const mimeType = 'text/plain; charset=utf-8';
+              for (const code of codes) {
+                // Generate a unique filename using timestamp and message ID to allow multiple reviews per course
+                const filename = `${code}_Current_Paper_Review_${messageId || Date.now()}.txt`;
+                const r2Key = `reviews/${code}_Current_Paper_Review_${messageId || Date.now()}.txt`;
+                await uploadFileToR2(r2Key, buffer, mimeType);
+                await saveFileMetadata(filename, r2Key, mimeType, sender, messageId);
+              }
+              await sendAndLogTextMessage(sender, `✅ Current paper review for ${codes.join(', ')} saved successfully to Cloudflare R2 and database.`);
+            } catch (err: any) {
+              addLog('error', `Failed to save admin review: ${err.message}`);
+              await sendAndLogTextMessage(sender, `❌ Error saving your review: ${err.message}`);
+            }
+            return; // Exit early to prevent treating it as a search request
+          }
+        }
+
         // AI processing handles messages, unless @all bypass is requested
         let intent;
         if (text.toLowerCase().includes('@all')) {
@@ -382,6 +409,15 @@ export async function POST(request: Request) {
             const limitQuantity = Math.max(1, parseInt(intent.quantity, 10) || 5);
             const contextTerms: string[] = intent.context_terms || [];
             const excludeTerms: string[] = intent.exclude_terms || [];
+
+            // Detect review/current in original message to prioritize/include reviews
+            const originalLower = text.toLowerCase();
+            if (originalLower.includes('review') && !contextTerms.includes('review')) {
+              contextTerms.push('review');
+            }
+            if (originalLower.includes('current') && !contextTerms.includes('current')) {
+              contextTerms.push('current');
+            }
 
             addLog('info', `AI requesting files: query="${searchQuery}", qty=${limitQuantity}, context=[${contextTerms}], exclude=[${excludeTerms}]`);
 
@@ -514,6 +550,15 @@ export async function POST(request: Request) {
                 const qty = Math.max(1, s.quantity || 5);
                 const ctx: string[] = s.context_terms || [];
                 const excl: string[] = s.exclude_terms || [];
+
+                // Detect review/current in original message to prioritize/include reviews
+                const originalLower = text.toLowerCase();
+                if (originalLower.includes('review') && !ctx.includes('review')) {
+                  ctx.push('review');
+                }
+                if (originalLower.includes('current') && !ctx.includes('current')) {
+                  ctx.push('current');
+                }
 
                 let dbFiles: any[] = [];
                 const directDbFile = await getFileByIdOrNameOrMessageId(sq);
