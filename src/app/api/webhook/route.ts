@@ -227,50 +227,28 @@ export async function POST(request: Request) {
       const isSenderAdmin = await isAdmin(sender);
       const MEDIA_TYPES = ['image', 'video', 'document', 'audio', 'voice', 'sticker'];
 
-      // 1. Handle Media Uploads
+      // 1. Handle Media Input (File uploads to server disabled — read title/caption only)
       if (MEDIA_TYPES.includes(message.type)) {
-        const mediaId = message[message.type]?.id;
         const caption = message[message.type]?.caption || '';
+        const rawFilename = (message.type === 'document' && message.document?.filename)
+          ? message.document.filename
+          : (message[message.type]?.filename || '');
 
-        if (mediaId) {
-          try {
-            await sendAndLogTextMessage(sender, `Downloading and saving your ${message.type}...`);
-            const { buffer, mimeType } = await downloadWhatsAppMedia(mediaId);
-
-            let rawFilename = '';
-            if (message.type === 'document' && message.document?.filename) {
-              rawFilename = message.document.filename;
-            } else {
-              rawFilename = caption || `file_${Date.now()}`;
-            }
-
-            const ext = mimeType.split('/')[1] || 'bin';
-            const safeExt = ext.split(';')[0] || 'bin';
-            let filename = rawFilename.replace(/\s+/g, '_');
-            if (!filename.toLowerCase().endsWith(`.${safeExt.toLowerCase()}`)) {
-              if (mimeType === 'application/pdf' && !filename.toLowerCase().endsWith('.pdf')) {
-                filename = `${filename}.pdf`;
-              } else {
-                filename = `${filename}.${safeExt}`;
-              }
-            }
-
-            const r2Key = `uploads/${filename}`;
-            await uploadFileToR2(r2Key, buffer, mimeType);
-            const savedFile = await saveFileMetadata(filename, r2Key, mimeType, sender);
-
-            let msg = `File saved! 📂 ${filename}`;
-            if (savedFile) msg += ` (ID: ${savedFile.id})`;
-            await sendAndLogTextMessage(sender, msg);
-          } catch (e: any) {
-            addLog('error', `Upload failed for ${sender}: ${e.message}`);
-            await sendAndLogTextMessage(sender, "Failed to process the upload.");
-          }
+        let mediaTitle = rawFilename || caption;
+        if (rawFilename && caption && rawFilename !== caption) {
+          mediaTitle = `${rawFilename} ${caption}`;
         }
+        mediaTitle = mediaTitle.trim();
 
-        if (!caption.trim()) return;
-        message.type = 'text';
-        message.text = { body: caption.trim() };
+        if (mediaTitle) {
+          addLog('info', `Media received from ${sender} (saving disabled). Reading title/caption: "${mediaTitle}"`);
+          message.type = 'text';
+          message.text = { body: mediaTitle };
+        } else {
+          addLog('info', `Media received from ${sender} without title/caption (saving disabled).`);
+          await sendAndLogTextMessage(sender, "Media file uploads are disabled. Please send a text message with your course code or study query.");
+          return;
+        }
       }
 
       // 2. Handle Text Messages
@@ -331,14 +309,14 @@ export async function POST(request: Request) {
             if (fallbackCodes.length > 1) {
               intent = {
                 type: 'send_files',
-                searches: fallbackCodes.map(code => ({ search_query: code, quantity: 10, context_terms: [], exclude_terms: [] })),
+                searches: fallbackCodes.map(code => ({ search_query: code, quantity: 5, context_terms: [], exclude_terms: [] })),
                 reply: `${fallbackCodes.length} courses ki files search ho rahi hain: ${fallbackCodes.join(', ')}. Please wait...`
               };
             } else if (fallbackCodes.length === 1) {
               intent = {
                 type: 'send_file',
                 search_query: fallbackCodes[0],
-                quantity: 10,
+                quantity: 5,
                 context_terms: [],
                 exclude_terms: [],
                 reply: `${fallbackCodes[0]} ki files search ho rahi hain. Please wait...`
