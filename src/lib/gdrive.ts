@@ -40,6 +40,9 @@ const DRIVE_FOLDER_IDS = [
   '1mM2fuhY0kvi5CuwLezbqriwZPTjmQzg7',
   '1i3v79NvfvB6-gCq1KgB-jwSLl3OoX9_O',
   '1otdtBp0wTC9KseXTAG7lf35VGbrQjw3k',
+  '113OIuRsjPIYxfREjAEpKCSDr5lGaKbbe',
+  '1pZVB8nO_xkkuBSqAFEDbtBe7xuPJlMDC',
+
 ];
 
 export interface GDriveFile {
