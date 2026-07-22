@@ -2,55 +2,89 @@ import axios from 'axios';
 import { getAvailableFiles } from './supabase';
 import { isMidtermFile, isFinalTermFile } from './fileFilters';
 
-const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID!;
-const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN!;
 const AI_MODEL = process.env.CLOUDFLARE_AI_MODEL || '@cf/qwen/qwen3-30b-a3b-fp8';
+
+const CLOUDFLARE_ACCOUNTS = [
+  // Primary (from environment variables)
+  {
+    id: process.env.CLOUDFLARE_ACCOUNT_ID || '',
+    token: process.env.CLOUDFLARE_API_TOKEN || '',
+  },
+  // Second Cloudflare Account
+  {
+    id: 'cc35137ba735c5cfce2c15703dd9d4e5',
+    token: 'cfut_P9jGaLwA6OR8GziNRulqVq4aAKPhsZPJjn9xC2Nrd7098765',
+  },
+  // Third Cloudflare Account
+  {
+    id: '89c82d8514139b83207a28d960146ebb',
+    token: 'cfut_8cfaTHPHNUdev2tOFViiiTf5OgZRfxLLqoBP26F524ef62b1',
+  }
+];
 
 /**
  * We use Cloudflare Workers AI via REST API because Vercel Serverless
  * does not support the native Cloudflare Workers bindings.
+ * If one account fails or limit is reached, it automatically falls back to subsequent ones.
  */
 export async function runCloudflareAI(messages: any[]): Promise<string> {
-  const url = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${AI_MODEL}`;
+  const activeAccounts = CLOUDFLARE_ACCOUNTS.filter(acc => acc.id && acc.token);
 
-  try {
-    const response = await axios.post(
-      url,
-      { messages },
-      {
-        headers: {
-          Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 25000, // 25s — running on VPS, not Vercel serverless
-      }
-    );
-
-    // Cloudflare can return 200 with { success: false, result: {}, errors: [...] }
-    const data = response.data;
-    if (!data?.success) {
-      console.error('Cloudflare AI returned unsuccessful response:', JSON.stringify(data));
-      throw new Error(`Cloudflare AI error: success=${data?.success}, errors=${JSON.stringify(data?.errors || [])}`);
-    }
-
-    // Try standard choices format first, then fall back to response field
-    const content = data?.result?.choices?.[0]?.message?.content ?? data?.result?.response;
-    if (content === undefined || content === null) {
-      console.error('Cloudflare AI did not return a response/content:', JSON.stringify(data));
-      throw new Error(`Cloudflare AI error: No response content found in result.`);
-    }
-
-    // Ensure content returned is a string
-    if (typeof content === 'object') {
-      return JSON.stringify(content);
-    }
-    return String(content);
-  } catch (error: any) {
-    const status = error.response?.status;
-    const errData = error.response?.data;
-    console.error(`Cloudflare AI error (status=${status}):`, errData || error.message);
-    throw new Error(`Cloudflare AI failed: status=${status}, message=${error.message}`);
+  if (activeAccounts.length === 0) {
+    throw new Error('No Cloudflare AI accounts are configured (missing ID or Token).');
   }
+
+  let lastError: any = null;
+
+  for (let i = 0; i < activeAccounts.length; i++) {
+    const acc = activeAccounts[i];
+    const url = `https://api.cloudflare.com/client/v4/accounts/${acc.id}/ai/run/${AI_MODEL}`;
+
+    try {
+      console.log(`[Cloudflare AI] Attempting API call with Account ${i + 1}/${activeAccounts.length} (ID: ${acc.id})...`);
+      const response = await axios.post(
+        url,
+        { messages },
+        {
+          headers: {
+            Authorization: `Bearer ${acc.token}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: 25000, // 25s
+        }
+      );
+
+      // Cloudflare can return 200 with { success: false, result: {}, errors: [...] }
+      const data = response.data;
+      if (!data?.success) {
+        console.error(`[Cloudflare AI] Account ${i + 1} returned unsuccessful response:`, JSON.stringify(data));
+        throw new Error(`Cloudflare AI error: success=${data?.success}, errors=${JSON.stringify(data?.errors || [])}`);
+      }
+
+      // Try standard choices format first, then fall back to response field
+      const content = data?.result?.choices?.[0]?.message?.content ?? data?.result?.response;
+      if (content === undefined || content === null) {
+        console.error(`[Cloudflare AI] Account ${i + 1} did not return a response/content:`, JSON.stringify(data));
+        throw new Error(`Cloudflare AI error: No response content found in result.`);
+      }
+
+      // Ensure content returned is a string
+      if (typeof content === 'object') {
+        return JSON.stringify(content);
+      }
+      return String(content);
+    } catch (error: any) {
+      const status = error.response?.status;
+      const errData = error.response?.data;
+      console.error(`[Cloudflare AI] Account ${i + 1} failed (status=${status}):`, errData || error.message);
+      lastError = error;
+      console.log(`[Cloudflare AI] Account ${i + 1} failed. Trying next configured account...`);
+    }
+  }
+
+  const status = lastError?.response?.status;
+  const errMsg = lastError?.response?.data || lastError?.message;
+  throw new Error(`All Cloudflare AI accounts failed. Last error: status=${status}, detail=${JSON.stringify(errMsg)}`);
 }
 
 /**
