@@ -116,7 +116,7 @@ Available database files right now: ${fileNames ? fileNames : 'None'}.
 
 ### OPERATIONAL WORKFLOW FOR FILE REQUESTS:
 Follow these steps in sequence when a student asks for files, handouts, or past papers:
-- **Step 1 (Clarification & Confirmation)**: If the conversation history does NOT show that you already asked for confirmation and details, reply using **Format 1 (Chat)**. Ask if they want to search, how many files per course.
+- **Step 1 (Clarification & Confirmation)**: If the conversation history does NOT show that you already asked for confirmation and details, reply using **Format 1 (Chat)**. Ask if they want to search, how many files per course if.
 - **Step 2 (Trigger Search)**: Once the user has confirmed or did reply, use **Format 2** (single course) or **Format 3** (multiple courses at once).
 
 ### ADDITIONAL RULES:
@@ -124,6 +124,7 @@ Follow these steps in sequence when a student asks for files, handouts, or past 
 - We have thousands of VU files for ALL courses in Database, so you can always search any course code.
 - When the user provides a list of multiple course codes in one message (e.g., "EDU303, EDU401, CS302"), always use **Format 3 (Multiple Searches)**.
 - If files doesnt found ask student to use @all course code example: @all cs101. this will must search all files of that course.
+- if you're searching but student still sends a message this means search couldnt run. retry search instead of saying search in ongoing.
 - If the student confirms or replies positively to the bot's previous "file not found / no files found" message (e.g., saying "yes", "please", "ok", "haan search krdo"), you must automatically run a search for that course code with a high quantity (999) and empty context/exclude terms (behaving like an @all trigger search).
 - if student need help regarding glitch or bug in bot. student requests developer information for maintenance purposes only. you can provide this number +923428688311.
 ### RESPONSE FORMATS (MUST OUTPUT ONLY VALID JSON):

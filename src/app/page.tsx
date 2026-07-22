@@ -37,8 +37,10 @@ export default function Home() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [retryingId, setRetryingId] = useState<string | null>(null);
   const [retryStatus, setRetryStatus] = useState<{ [key: string]: 'success' | 'error' | null }>({});
+  const [editingMsg, setEditingMsg] = useState<Message | null>(null);
+  const [editText, setEditText] = useState<string>('');
 
-  const handleRetry = async (msg: Message) => {
+  const handleRetry = async (msg: Message, customText: string) => {
     setRetryingId(msg.id);
     setRetryStatus(prev => ({ ...prev, [msg.id]: null }));
     try {
@@ -55,7 +57,7 @@ export default function Home() {
                       from: msg.sender,
                       type: 'text',
                       text: {
-                        body: msg.text
+                        body: customText
                       }
                     }
                   ]
@@ -317,7 +319,10 @@ export default function Home() {
                       <span className="text-[10px] text-zinc-600">{formatTime(msg.created_at)}</span>
                       {msg.direction === 'incoming' && (
                         <button
-                          onClick={() => handleRetry(msg)}
+                          onClick={() => {
+                            setEditingMsg(msg);
+                            setEditText(msg.text);
+                          }}
                           disabled={retryingId !== null}
                           className={`text-[10px] font-semibold flex items-center gap-1 px-1.5 py-0.5 rounded transition-all duration-200 cursor-pointer ${
                             retryingId === msg.id
@@ -355,6 +360,46 @@ export default function Home() {
           )}
         </div>
       </main>
+
+      {/* Edit & Retry Modal */}
+      {editingMsg && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm animate-fade-in">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-lg p-6 shadow-2xl flex flex-col gap-4">
+            <div>
+              <h3 className="text-lg font-semibold text-zinc-100">Edit & Retry Message</h3>
+              <p className="text-xs text-zinc-500 mt-1">
+                Sending on behalf of user: <span className="font-mono text-zinc-300">{editingMsg.sender}</span>
+              </p>
+            </div>
+            
+            <textarea
+              value={editText}
+              onChange={(e) => setEditText(e.target.value)}
+              rows={5}
+              className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-sm text-zinc-200 placeholder-zinc-650 focus:outline-none focus:border-zinc-700 font-sans resize-none leading-relaxed"
+              placeholder="Type custom message to retry..."
+            />
+
+            <div className="flex justify-end gap-3 pt-2">
+              <button
+                onClick={() => setEditingMsg(null)}
+                className="px-4 py-2 text-sm font-medium rounded-xl text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  handleRetry(editingMsg, editText);
+                  setEditingMsg(null);
+                }}
+                className="px-4 py-2 text-sm font-semibold rounded-xl bg-blue-600 hover:bg-blue-500 text-white transition-all shadow-lg shadow-blue-500/10 cursor-pointer"
+              >
+                Retry Message
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
