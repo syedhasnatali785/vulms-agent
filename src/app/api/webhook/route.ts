@@ -414,67 +414,96 @@ export async function POST(request: Request) {
           }
         } else {
           try {
-            const history = await getMessagesBySender(sender, 10);
-            
-            // Check for file-not-found fallback confirmation
-            let isFallbackConfirmation = false;
-            let fallbackCodes: string[] = [];
+            // Check if course/subject codes are detected in the current message
+            const detectedCodes = extractCourseCodes(text);
+            if (detectedCodes.length > 0) {
+              addLog('info', `Subject codes detected: [${detectedCodes.join(', ')}] - bypassing AI for direct search (limit 10)`);
+              const params = extractSmartSearchParams(text);
 
-            // We need to look at the previous bot message.
-            // history contains the current user message as the last element.
-            // So history[history.length - 1] is the current user message (direction: 'incoming').
-            // history[history.length - 2] is the bot's last response (direction: 'outgoing').
-            if (history.length >= 2) {
-              const lastOutgoing = history[history.length - 2];
-
-              if (
-                lastOutgoing && 
-                lastOutgoing.direction === 'outgoing' &&
-                (lastOutgoing.text.toLowerCase().includes('no files found') || 
-                 lastOutgoing.text.toLowerCase().includes('koi file nahi mili') ||
-                 lastOutgoing.text.toLowerCase().includes('not found') ||
-                 lastOutgoing.text.toLowerCase().includes('nahi mili'))
-              ) {
-                // Check if current message is a confirmation
-                if (isConfirmationMessage(text)) {
-                  // Extract course codes from the bot's error message
-                  fallbackCodes = extractCourseCodes(lastOutgoing.text);
-
-                  // If not found in the bot message, check the previous incoming message (history[history.length - 3])
-                  if (fallbackCodes.length === 0 && history.length >= 3) {
-                    const prevIncoming = history[history.length - 3];
-                    if (prevIncoming && prevIncoming.direction === 'incoming') {
-                      fallbackCodes = extractCourseCodes(prevIncoming.text);
-                    }
-                  }
-
-                  if (fallbackCodes.length > 0) {
-                    isFallbackConfirmation = true;
-                  }
-                }
-              }
-            }
-
-            if (isFallbackConfirmation && fallbackCodes.length > 0) {
-              addLog('info', `Detected confirmation for failed files. Triggering auto @all search for: ${fallbackCodes.join(', ')}`);
-              if (fallbackCodes.length > 1) {
+              if (detectedCodes.length > 1) {
                 intent = {
                   type: 'send_files',
-                  searches: fallbackCodes.map(code => ({ search_query: code, quantity: 999, context_terms: [], exclude_terms: [] })),
-                  reply: `🔍 Auto @all search initiated: ${fallbackCodes.length} courses ki tamam files search ho rahi hain (${fallbackCodes.join(', ')})...`
+                  searches: detectedCodes.map(code => ({
+                    search_query: code,
+                    quantity: 10,
+                    context_terms: params.contextTerms,
+                    exclude_terms: params.excludeTerms
+                  })),
+                  reply: `🔍 Direct search: ${detectedCodes.length} courses ki files search ho rahi hain (${detectedCodes.join(', ')}). Please wait...`
                 };
               } else {
                 intent = {
                   type: 'send_file',
-                  search_query: fallbackCodes[0],
-                  quantity: 999,
-                  context_terms: [],
-                  exclude_terms: [],
-                  reply: `🔍 Auto @all search initiated: ${fallbackCodes[0]} ki tamam files search ho rahi hain...`
+                  search_query: detectedCodes[0],
+                  quantity: 10,
+                  context_terms: params.contextTerms,
+                  exclude_terms: params.excludeTerms,
+                  reply: `🔍 Direct search: ${detectedCodes[0]} ki files search ho rahi hain. Please wait...`
                 };
               }
             } else {
-              intent = await processUserIntent(text, isSenderAdmin, history);
+              const history = await getMessagesBySender(sender, 10);
+              
+              // Check for file-not-found fallback confirmation
+              let isFallbackConfirmation = false;
+              let fallbackCodes: string[] = [];
+
+              // We need to look at the previous bot message.
+              // history contains the current user message as the last element.
+              // So history[history.length - 1] is the current user message (direction: 'incoming').
+              // history[history.length - 2] is the bot's last response (direction: 'outgoing').
+              if (history.length >= 2) {
+                const lastOutgoing = history[history.length - 2];
+
+                if (
+                  lastOutgoing && 
+                  lastOutgoing.direction === 'outgoing' &&
+                  (lastOutgoing.text.toLowerCase().includes('no files found') || 
+                   lastOutgoing.text.toLowerCase().includes('koi file nahi mili') ||
+                   lastOutgoing.text.toLowerCase().includes('not found') ||
+                   lastOutgoing.text.toLowerCase().includes('nahi mili'))
+                ) {
+                  // Check if current message is a confirmation
+                  if (isConfirmationMessage(text)) {
+                    // Extract course codes from the bot's error message
+                    fallbackCodes = extractCourseCodes(lastOutgoing.text);
+
+                    // If not found in the bot message, check the previous incoming message (history[history.length - 3])
+                    if (fallbackCodes.length === 0 && history.length >= 3) {
+                      const prevIncoming = history[history.length - 3];
+                      if (prevIncoming && prevIncoming.direction === 'incoming') {
+                        fallbackCodes = extractCourseCodes(prevIncoming.text);
+                      }
+                    }
+
+                    if (fallbackCodes.length > 0) {
+                      isFallbackConfirmation = true;
+                    }
+                  }
+                }
+              }
+
+              if (isFallbackConfirmation && fallbackCodes.length > 0) {
+                addLog('info', `Detected confirmation for failed files. Triggering auto @all search for: ${fallbackCodes.join(', ')}`);
+                if (fallbackCodes.length > 1) {
+                  intent = {
+                    type: 'send_files',
+                    searches: fallbackCodes.map(code => ({ search_query: code, quantity: 999, context_terms: [], exclude_terms: [] })),
+                    reply: `🔍 Auto @all search initiated: ${fallbackCodes.length} courses ki tamam files search ho rahi hain (${fallbackCodes.join(', ')})...`
+                  };
+                } else {
+                  intent = {
+                    type: 'send_file',
+                    search_query: fallbackCodes[0],
+                    quantity: 999,
+                    context_terms: [],
+                    exclude_terms: [],
+                    reply: `🔍 Auto @all search initiated: ${fallbackCodes[0]} ki tamam files search ho rahi hain...`
+                  };
+                }
+              } else {
+                intent = await processUserIntent(text, isSenderAdmin, history);
+              }
             }
             
             addLog('info', `AI intent: ${intent.type}`);
