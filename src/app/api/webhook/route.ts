@@ -644,7 +644,7 @@ export async function POST(request: Request) {
               if (messageId && userLastMessageId.get(sender) !== messageId) return;
 
               if (files.length === 0) {
-                await sendAndLogTextMessage(sender, `❌ "${query}" ke liye koi file nahi mili.`);
+                await sendAndLogTextMessage(sender, `❌ "${query}" ke liye koi file nahi mili. please @all "${query}" try kre is se apko is subject ki tamam files mil jainge.`);
                 continue;
               }
 
