@@ -88,6 +88,24 @@ function isConversationalQuery(text: string): boolean {
   return clean.split(/\s+/).every(w => CONVERSATIONAL_WORDS.has(w));
 }
 
+function isConfirmationMessage(text: string): boolean {
+  const clean = text.toLowerCase().trim();
+  // Match standard Roman Urdu/English affirmative words/phrases
+  const confirmRegex = /^(yes|ok|okay|yep|yup|sure|please|pls|g|ji|haan|han|haaan|kar\s*do|krdo|kro|haji|do\s*it|sahi|bilkul|go\s*ahead|confirm)$/i;
+  
+  if (confirmRegex.test(clean)) return true;
+  
+  // If it's a short sentence containing confirmation keywords
+  if (clean.length < 20) {
+    const hasKeyword = /\b(yes|ok|okay|please|pls|haan|han|ji|g|kar\s*do|krdo|confirm|bhej\s*do|bhejdo|check)\b/i.test(clean);
+    // Exclude negative words just in case
+    const hasNegative = /\b(no|not|nah|dont|don't|nahi|naa|na)\b/i.test(clean);
+    return hasKeyword && !hasNegative;
+  }
+  
+  return false;
+}
+
 /**
  * SMART keyword extraction: extracts subject code + context terms from user message.
  * Example: "cs405 finale term files send kar do"
@@ -397,7 +415,68 @@ export async function POST(request: Request) {
         } else {
           try {
             const history = await getMessagesBySender(sender, 10);
-            intent = await processUserIntent(text, isSenderAdmin, history);
+            
+            // Check for file-not-found fallback confirmation
+            let isFallbackConfirmation = false;
+            let fallbackCodes: string[] = [];
+
+            // We need to look at the previous bot message.
+            // history contains the current user message as the last element.
+            // So history[history.length - 1] is the current user message (direction: 'incoming').
+            // history[history.length - 2] is the bot's last response (direction: 'outgoing').
+            if (history.length >= 2) {
+              const lastOutgoing = history[history.length - 2];
+
+              if (
+                lastOutgoing && 
+                lastOutgoing.direction === 'outgoing' &&
+                (lastOutgoing.text.toLowerCase().includes('no files found') || 
+                 lastOutgoing.text.toLowerCase().includes('koi file nahi mili') ||
+                 lastOutgoing.text.toLowerCase().includes('not found') ||
+                 lastOutgoing.text.toLowerCase().includes('nahi mili'))
+              ) {
+                // Check if current message is a confirmation
+                if (isConfirmationMessage(text)) {
+                  // Extract course codes from the bot's error message
+                  fallbackCodes = extractCourseCodes(lastOutgoing.text);
+
+                  // If not found in the bot message, check the previous incoming message (history[history.length - 3])
+                  if (fallbackCodes.length === 0 && history.length >= 3) {
+                    const prevIncoming = history[history.length - 3];
+                    if (prevIncoming && prevIncoming.direction === 'incoming') {
+                      fallbackCodes = extractCourseCodes(prevIncoming.text);
+                    }
+                  }
+
+                  if (fallbackCodes.length > 0) {
+                    isFallbackConfirmation = true;
+                  }
+                }
+              }
+            }
+
+            if (isFallbackConfirmation && fallbackCodes.length > 0) {
+              addLog('info', `Detected confirmation for failed files. Triggering auto @all search for: ${fallbackCodes.join(', ')}`);
+              if (fallbackCodes.length > 1) {
+                intent = {
+                  type: 'send_files',
+                  searches: fallbackCodes.map(code => ({ search_query: code, quantity: 999, context_terms: [], exclude_terms: [] })),
+                  reply: `🔍 Auto @all search initiated: ${fallbackCodes.length} courses ki tamam files search ho rahi hain (${fallbackCodes.join(', ')})...`
+                };
+              } else {
+                intent = {
+                  type: 'send_file',
+                  search_query: fallbackCodes[0],
+                  quantity: 999,
+                  context_terms: [],
+                  exclude_terms: [],
+                  reply: `🔍 Auto @all search initiated: ${fallbackCodes[0]} ki tamam files search ho rahi hain...`
+                };
+              }
+            } else {
+              intent = await processUserIntent(text, isSenderAdmin, history);
+            }
+            
             addLog('info', `AI intent: ${intent.type}`);
           } catch (aiErr: any) {
             addLog('error', `AI error: ${aiErr.message}`);

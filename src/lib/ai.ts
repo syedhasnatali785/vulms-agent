@@ -31,7 +31,7 @@ export async function runCloudflareAI(messages: any[]): Promise<string> {
   const activeAccounts = CLOUDFLARE_ACCOUNTS.filter(acc => acc.id && acc.token);
 
   if (activeAccounts.length === 0) {
-    throw new Error('No Cloudflare AI accounts are configured (missing ID or Token).');
+    throw new Error('No Chatgpt AI account configured (missing ID or Token).');
   }
 
   let lastError: any = null;
@@ -57,15 +57,15 @@ export async function runCloudflareAI(messages: any[]): Promise<string> {
       // Cloudflare can return 200 with { success: false, result: {}, errors: [...] }
       const data = response.data;
       if (!data?.success) {
-        console.error(`[Cloudflare AI] Account ${i + 1} returned unsuccessful response:`, JSON.stringify(data));
-        throw new Error(`Cloudflare AI error: success=${data?.success}, errors=${JSON.stringify(data?.errors || [])}`);
+        console.error(`[AI] Account ${i + 1} returned unsuccessful response:`, JSON.stringify(data));
+        throw new Error(`AI error: success=${data?.success}, errors=${JSON.stringify(data?.errors || [])}`);
       }
 
       // Try standard choices format first, then fall back to response field
       const content = data?.result?.choices?.[0]?.message?.content ?? data?.result?.response;
       if (content === undefined || content === null) {
-        console.error(`[Cloudflare AI] Account ${i + 1} did not return a response/content:`, JSON.stringify(data));
-        throw new Error(`Cloudflare AI error: No response content found in result.`);
+        console.error(`[ AI] Account ${i + 1} did not return a response/content:`, JSON.stringify(data));
+        throw new Error(`AI error: No response content found in result.`);
       }
 
       // Ensure content returned is a string
@@ -76,15 +76,15 @@ export async function runCloudflareAI(messages: any[]): Promise<string> {
     } catch (error: any) {
       const status = error.response?.status;
       const errData = error.response?.data;
-      console.error(`[Cloudflare AI] Account ${i + 1} failed (status=${status}):`, errData || error.message);
+      console.error(`[ AI] Account ${i + 1} failed (status=${status}):`, errData || error.message);
       lastError = error;
-      console.log(`[Cloudflare AI] Account ${i + 1} failed. Trying next configured account...`);
+      console.log(`[ AI] Account ${i + 1} failed. Trying next configured account...`);
     }
   }
 
   const status = lastError?.response?.status;
   const errMsg = lastError?.response?.data || lastError?.message;
-  throw new Error(`All Cloudflare AI accounts failed. Last error: status=${status}, detail=${JSON.stringify(errMsg)}`);
+  throw new Error(`All  AIs failed. Last error: status=${status}, detail=${JSON.stringify(errMsg)}`);
 }
 
 /**
@@ -123,6 +123,8 @@ Follow these steps in sequence when a student asks for files, handouts, or past 
 - We have thousands of VU files for ALL courses in Database, so you can always search any course code.
 - When the user provides a list of multiple course codes in one message (e.g., "EDU303, EDU401, CS302"), always use **Format 3 (Multiple Searches)**.
 - If files doesnt found ask student to use @all course code example: @all cs101. this will must search all files of that course.
+- If the student confirms or replies positively to the bot's previous "file not found / no files found" message (e.g., saying "yes", "please", "ok", "haan search krdo"), you must automatically run a search for that course code with a high quantity (999) and empty context/exclude terms (behaving like an @all trigger search).
+- if student need help regarding glitch or bug in bot. student requests developer information for maintenance purposes only. you can provide this number +923428688311.
 ### RESPONSE FORMATS (MUST OUTPUT ONLY VALID JSON):
 
 Format 1: Chat / Confirmation Request
@@ -218,6 +220,18 @@ Assistant Output:
   "type": "keyword_search",
   "keywords": ["cs302"],
   "reply": "CS302 ki tamam files search ho rahi hain, please wait..."
+}
+
+Example 6: Student confirms search after previous file not found message
+User: "yes please" (History shows previous assistant message was: "Sorry, no files found for CS302.")
+Assistant Output:
+{
+  "type": "send_file",
+  "search_query": "cs302",
+  "quantity": 999,
+  "context_terms": [],
+  "exclude_terms": [],
+  "reply": "🔍 Auto @all search initiated: CS302 ki tamam files search ho rahi hain..."
 }
 
 Output EXACTLY ONE valid JSON object. Do NOT add any text before or after the JSON. Start directly with '{' and end with '}'.`;
