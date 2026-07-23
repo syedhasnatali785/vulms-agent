@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { isAdmin, addAdmin, saveFileMetadata, getFileByIdOrNameOrMessageId, extractCourseKeywords, getFilesByKeywords, saveMessage, saveLog, hasUserSentNewMessage, getMessagesBySender } from '@/lib/supabase';
-import { downloadWhatsAppMedia, sendTextMessage, sendMediaMessage } from '@/lib/whatsapp';
+import { downloadWhatsAppMedia, sendTextMessage, sendMediaMessage, sendButtonMessage } from '@/lib/whatsapp';
 import { uploadFileToR2, getFileUrl, downloadFileContentFromR2 } from '@/lib/r2';
 import { processUserIntent, classifyAdminReview } from '@/lib/ai';
 import { searchGDriveFiles } from '@/lib/gdrive';
@@ -261,6 +261,17 @@ export async function POST(request: Request) {
       }
       addLog('info', `← Message from ${sender}: type=${message.type}`);
 
+      // Handle Interactive Button Replies
+      if (message.type === 'interactive') {
+        const interactive = message.interactive;
+        if (interactive?.type === 'button_reply') {
+          const buttonReply = interactive.button_reply;
+          addLog('info', `Button reply received from ${sender}: id=${buttonReply.id}, title=${buttonReply.title}`);
+          message.type = 'text';
+          message.text = { body: buttonReply.title || buttonReply.id || '' };
+        }
+      }
+
       const isSenderAdmin = await isAdmin(sender);
       const MEDIA_TYPES = ['image', 'video', 'document', 'audio', 'voice', 'sticker'];
 
@@ -414,95 +425,158 @@ export async function POST(request: Request) {
           }
         } else {
           try {
+            const history = await getMessagesBySender(sender, 10);
+
             // Check if course/subject codes are detected in the current message
             const detectedCodes = extractCourseCodes(text);
             if (detectedCodes.length > 0) {
               addLog('info', `Subject codes detected: [${detectedCodes.join(', ')}] - bypassing AI for direct search (limit 10)`);
-              const params = extractSmartSearchParams(text);
+              
+              // Prevent duplicate search if found in history: "🔍 Direct search: {subjectcode} ki files search ho rahi hain. Please wait..."
+              const duplicateSearches = detectedCodes.filter(code => {
+                const codeUpper = code.toUpperCase();
+                return history.some((msg: any) => {
+                  if (msg.direction !== 'outgoing') return false;
+                  const msgText = msg.text;
+                  return msgText.includes('Direct search:') && 
+                         !msgText.includes('@all') && 
+                         msgText.toUpperCase().includes(codeUpper);
+                });
+              });
 
-              if (detectedCodes.length > 1) {
+              if (duplicateSearches.length > 0) {
+                const codesStr = duplicateSearches.join(', ').toUpperCase();
                 intent = {
-                  type: 'send_files',
-                  searches: detectedCodes.map(code => ({
-                    search_query: code,
-                    quantity: 10,
-                    context_terms: params.contextTerms,
-                    exclude_terms: params.excludeTerms
-                  })),
-                  reply: `🔍 Direct search: ${detectedCodes.length} courses ki files search ho rahi hain (${detectedCodes.join(', ')}). Please wait...`
+                  type: 'chat',
+                  reply: `Aap ${codesStr} ki files pehle hi search kar chuke hain. Kya aap dobara search karna chahte hain?`
                 };
               } else {
-                intent = {
-                  type: 'send_file',
-                  search_query: detectedCodes[0],
-                  quantity: 10,
-                  context_terms: params.contextTerms,
-                  exclude_terms: params.excludeTerms,
-                  reply: `🔍 Direct search: ${detectedCodes[0]} ki files search ho rahi hain. Please wait...`
-                };
+                const params = extractSmartSearchParams(text);
+
+                if (detectedCodes.length > 1) {
+                  intent = {
+                    type: 'send_files',
+                    searches: detectedCodes.map(code => ({
+                      search_query: code,
+                      quantity: 10,
+                      context_terms: params.contextTerms,
+                      exclude_terms: params.excludeTerms
+                    })),
+                    reply: `🔍 Direct search: ${detectedCodes.length} courses ki files search ho rahi hain (${detectedCodes.join(', ')}). Please wait...`
+                  };
+                } else {
+                  intent = {
+                    type: 'send_file',
+                    search_query: detectedCodes[0],
+                    quantity: 10,
+                    context_terms: params.contextTerms,
+                    exclude_terms: params.excludeTerms,
+                    reply: `🔍 Direct search: ${detectedCodes[0]} ki files search ho rahi hain. Please wait...`
+                  };
+                }
               }
             } else {
-              const history = await getMessagesBySender(sender, 10);
-              
-              // Check for file-not-found fallback confirmation
-              let isFallbackConfirmation = false;
-              let fallbackCodes: string[] = [];
+              // Check for duplicate search confirmation
+              let isDuplicateConfirmation = false;
+              let duplicateCodes: string[] = [];
 
-              // We need to look at the previous bot message.
-              // history contains the current user message as the last element.
-              // So history[history.length - 1] is the current user message (direction: 'incoming').
-              // history[history.length - 2] is the bot's last response (direction: 'outgoing').
               if (history.length >= 2) {
                 const lastOutgoing = history[history.length - 2];
-
                 if (
-                  lastOutgoing && 
+                  lastOutgoing &&
                   lastOutgoing.direction === 'outgoing' &&
-                  (lastOutgoing.text.toLowerCase().includes('no files found') || 
-                   lastOutgoing.text.toLowerCase().includes('koi file nahi mili') ||
-                   lastOutgoing.text.toLowerCase().includes('not found') ||
-                   lastOutgoing.text.toLowerCase().includes('nahi mili'))
+                  lastOutgoing.text.includes('dobara search karna chahte hain')
                 ) {
-                  // Check if current message is a confirmation
                   if (isConfirmationMessage(text)) {
-                    // Extract course codes from the bot's error message
-                    fallbackCodes = extractCourseCodes(lastOutgoing.text);
-
-                    // If not found in the bot message, check the previous incoming message (history[history.length - 3])
-                    if (fallbackCodes.length === 0 && history.length >= 3) {
-                      const prevIncoming = history[history.length - 3];
-                      if (prevIncoming && prevIncoming.direction === 'incoming') {
-                        fallbackCodes = extractCourseCodes(prevIncoming.text);
-                      }
-                    }
-
-                    if (fallbackCodes.length > 0) {
-                      isFallbackConfirmation = true;
+                    duplicateCodes = extractCourseCodes(lastOutgoing.text);
+                    if (duplicateCodes.length > 0) {
+                      isDuplicateConfirmation = true;
                     }
                   }
                 }
               }
 
-              if (isFallbackConfirmation && fallbackCodes.length > 0) {
-                addLog('info', `Detected confirmation for failed files. Triggering auto @all search for: ${fallbackCodes.join(', ')}`);
-                if (fallbackCodes.length > 1) {
+              if (isDuplicateConfirmation && duplicateCodes.length > 0) {
+                addLog('info', `User confirmed duplicate search for: ${duplicateCodes.join(', ')}`);
+                const params = extractSmartSearchParams(text);
+                if (duplicateCodes.length > 1) {
                   intent = {
                     type: 'send_files',
-                    searches: fallbackCodes.map(code => ({ search_query: code, quantity: 999, context_terms: [], exclude_terms: [] })),
-                    reply: `🔍 Auto @all search initiated: ${fallbackCodes.length} courses ki tamam files search ho rahi hain (${fallbackCodes.join(', ')})...`
+                    searches: duplicateCodes.map(code => ({
+                      search_query: code,
+                      quantity: 10,
+                      context_terms: params.contextTerms,
+                      exclude_terms: params.excludeTerms
+                    })),
+                    reply: `🔍 Direct search: ${duplicateCodes.length} courses ki files search ho rahi hain (${duplicateCodes.join(', ')}). Please wait...`
                   };
                 } else {
                   intent = {
                     type: 'send_file',
-                    search_query: fallbackCodes[0],
-                    quantity: 999,
-                    context_terms: [],
-                    exclude_terms: [],
-                    reply: `🔍 Auto @all search initiated: ${fallbackCodes[0]} ki tamam files search ho rahi hain...`
+                    search_query: duplicateCodes[0],
+                    quantity: 10,
+                    context_terms: params.contextTerms,
+                    exclude_terms: params.excludeTerms,
+                    reply: `🔍 Direct search: ${duplicateCodes[0]} ki files search ho rahi hain. Please wait...`
                   };
                 }
               } else {
-                intent = await processUserIntent(text, isSenderAdmin, history);
+                // Check for file-not-found fallback confirmation
+                let isFallbackConfirmation = false;
+                let fallbackCodes: string[] = [];
+
+                if (history.length >= 2) {
+                  const lastOutgoing = history[history.length - 2];
+
+                  if (
+                    lastOutgoing && 
+                    lastOutgoing.direction === 'outgoing' &&
+                    (lastOutgoing.text.toLowerCase().includes('no files found') || 
+                     lastOutgoing.text.toLowerCase().includes('koi file nahi mili') ||
+                     lastOutgoing.text.toLowerCase().includes('not found') ||
+                     lastOutgoing.text.toLowerCase().includes('nahi mili'))
+                  ) {
+                    // Check if current message is a confirmation
+                    if (isConfirmationMessage(text)) {
+                      // Extract course codes from the bot's error message
+                      fallbackCodes = extractCourseCodes(lastOutgoing.text);
+
+                      // If not found in the bot message, check the previous incoming message (history[history.length - 3])
+                      if (fallbackCodes.length === 0 && history.length >= 3) {
+                        const prevIncoming = history[history.length - 3];
+                        if (prevIncoming && prevIncoming.direction === 'incoming') {
+                          fallbackCodes = extractCourseCodes(prevIncoming.text);
+                        }
+                      }
+
+                      if (fallbackCodes.length > 0) {
+                        isFallbackConfirmation = true;
+                      }
+                    }
+                  }
+                }
+
+                if (isFallbackConfirmation && fallbackCodes.length > 0) {
+                  addLog('info', `Detected confirmation for failed files. Triggering auto @all search for: ${fallbackCodes.join(', ')}`);
+                  if (fallbackCodes.length > 1) {
+                    intent = {
+                      type: 'send_files',
+                      searches: fallbackCodes.map(code => ({ search_query: code, quantity: 999, context_terms: [], exclude_terms: [] })),
+                      reply: `🔍 Auto @all search initiated: ${fallbackCodes.length} courses ki tamam files search ho rahi hain (${fallbackCodes.join(', ')})...`
+                    };
+                  } else {
+                    intent = {
+                      type: 'send_file',
+                      search_query: fallbackCodes[0],
+                      quantity: 999,
+                      context_terms: [],
+                      exclude_terms: [],
+                      reply: `🔍 Auto @all search initiated: ${fallbackCodes[0]} ki tamam files search ho rahi hain...`
+                    };
+                  }
+                } else {
+                  intent = await processUserIntent(text, isSenderAdmin, history);
+                }
               }
             }
             
@@ -542,11 +616,21 @@ export async function POST(request: Request) {
               await sendAndLogTextMessage(sender, "Only admins can add new admins.");
             }
             break;
-          case 'send_file':
+          case 'send_file': {
             const searchQuery = intent.search_query || intent.filename || text;
             const limitQuantity = Math.max(1, parseInt(intent.quantity, 10) || 5);
             const contextTerms: string[] = intent.context_terms || [];
             const excludeTerms: string[] = intent.exclude_terms || [];
+            const isAllSearch = !!(intent.isAllSearch || text.toLowerCase().includes('@all') || limitQuantity === 999);
+
+            if (isAllSearch) {
+              const mids = ['mid', 'midterm', 'midterms', 'mids'];
+              for (const mid of mids) {
+                if (!excludeTerms.includes(mid)) {
+                  excludeTerms.push(mid);
+                }
+              }
+            }
 
             // Detect review/current in original message to prioritize/include reviews
             const originalLower = text.toLowerCase();
@@ -606,6 +690,11 @@ export async function POST(request: Request) {
 
             for (const f of dbFiles) {
               const nameLower = f.filename.toLowerCase();
+              if (isAllSearch) {
+                if (isMidtermFile(f.filename) || !isFinalTermFile(f.filename)) {
+                  continue;
+                }
+              }
               if (!seenNames.has(nameLower)) {
                 seenNames.add(nameLower);
                 allFiles.push({ source: 'db', file: f, name: f.filename });
@@ -614,6 +703,11 @@ export async function POST(request: Request) {
 
             for (const f of driveFiles) {
               const nameLower = f.name.toLowerCase();
+              if (isAllSearch) {
+                if (isMidtermFile(f.name) || !isFinalTermFile(f.name)) {
+                  continue;
+                }
+              }
               if (!seenNames.has(nameLower)) {
                 seenNames.add(nameLower);
                 allFiles.push({ source: 'gdrive', file: f, name: f.name });
@@ -667,10 +761,27 @@ export async function POST(request: Request) {
                   })
                 );
               }
+
+              // Send interactive button message if files are delivered and this is NOT an @all search
+              if (!isAllSearch) {
+                const detectedCodes = extractCourseCodes(searchQuery);
+                const codeForButton = detectedCodes[0] || extractCourseCodes(text)[0];
+                if (codeForButton) {
+                  const romanUrduText = `Kya aap chahte hain ke main course ${codeForButton.toUpperCase()} ki tamam files search karoon?`;
+                  const buttonTitle = `@all ${codeForButton.toUpperCase()}`;
+                  try {
+                    await sendButtonMessage(sender, romanUrduText, [{ id: buttonTitle.toLowerCase(), title: buttonTitle }]);
+                    addLog('info', `→ Sent @all button message for ${codeForButton} to ${sender}`);
+                  } catch (err: any) {
+                    addLog('error', `Failed to send button message: ${err.message}`);
+                  }
+                }
+              }
             } else {
               await sendAndLogTextMessage(sender, intent.reply || `Sorry, no files found for "${searchQuery}".`);
             }
             break;
+          }
 
           case 'send_files': {
             // Multiple courses — run all searches in parallel then send results sequentially
@@ -678,6 +789,8 @@ export async function POST(request: Request) {
               intent.searches || [];
 
             if (multiSearches.length === 0) break;
+
+            const hasAllKeyword = text.toLowerCase().includes('@all');
 
             await sendAndLogTextMessage(sender, intent.reply || `${multiSearches.length} courses ki files search ho rahi hain. Please wait...`);
 
@@ -688,6 +801,16 @@ export async function POST(request: Request) {
                 const qty = Math.max(1, s.quantity || 5);
                 const ctx: string[] = s.context_terms || [];
                 const excl: string[] = s.exclude_terms || [];
+                const localIsAllSearch = !!(hasAllKeyword || qty === 999);
+
+                if (localIsAllSearch) {
+                  const mids = ['mid', 'midterm', 'midterms', 'mids'];
+                  for (const mid of mids) {
+                    if (!excl.includes(mid)) {
+                      excl.push(mid);
+                    }
+                  }
+                }
 
                 // Detect review/current in original message to prioritize/include reviews
                 const originalLower = text.toLowerCase();
@@ -731,19 +854,29 @@ export async function POST(request: Request) {
                 const merged: { source: 'db' | 'gdrive'; file: any; name: string }[] = [];
                 for (const f of dbFiles) {
                   const nl = f.filename.toLowerCase();
+                  if (localIsAllSearch) {
+                    if (isMidtermFile(f.filename) || !isFinalTermFile(f.filename)) {
+                      continue;
+                    }
+                  }
                   if (!seen.has(nl)) { seen.add(nl); merged.push({ source: 'db', file: f, name: f.filename }); }
                 }
                 for (const f of driveFiles) {
                   const nl = f.name.toLowerCase();
+                  if (localIsAllSearch) {
+                    if (isMidtermFile(f.name) || !isFinalTermFile(f.name)) {
+                      continue;
+                    }
+                  }
                   if (!seen.has(nl)) { seen.add(nl); merged.push({ source: 'gdrive', file: f, name: f.name }); }
                 }
 
-                return { query: sq, files: merged.slice(0, qty) };
+                return { query: sq, files: merged.slice(0, qty), isAllSearch: localIsAllSearch };
               })
             );
 
             // Send results course-by-course
-            for (const { query, files } of searchResults) {
+            for (const { query, files, isAllSearch } of searchResults) {
               // Cancellation check between courses
               if (triggerMessageDbId) {
                 const hasNew = await hasUserSentNewMessage(sender, triggerMessageDbId, triggerMessageCreatedAt);
@@ -783,6 +916,22 @@ export async function POST(request: Request) {
                     }
                   })
                 );
+              }
+
+              // Send interactive button message if files are delivered and this is NOT an @all search
+              if (!isAllSearch) {
+                const detectedCodes = extractCourseCodes(query);
+                const codeForButton = detectedCodes[0];
+                if (codeForButton) {
+                  const romanUrduText = `Kya aap chahte hain ke main course ${codeForButton.toUpperCase()} ki tamam files search karoon?`;
+                  const buttonTitle = `@all ${codeForButton.toUpperCase()}`;
+                  try {
+                    await sendButtonMessage(sender, romanUrduText, [{ id: buttonTitle.toLowerCase(), title: buttonTitle }]);
+                    addLog('info', `→ Sent @all button message for ${codeForButton} to ${sender}`);
+                  } catch (err: any) {
+                    addLog('error', `Failed to send button message: ${err.message}`);
+                  }
+                }
               }
             }
             break;
@@ -843,8 +992,17 @@ export async function POST(request: Request) {
           }
 
           case 'chat':
-          default:
-            await sendAndLogTextMessage(sender, intent.reply || "Mujhe samajh nahi aaya. Course code likhein (jaise CS302).");
+            if (intent.reply && intent.reply.includes('dobara search karna chahte hain')) {
+              try {
+                await sendButtonMessage(sender, intent.reply, [{ id: 'confirm_dup_search', title: 'Haan, search kar do' }]);
+                addLog('info', `→ Sent duplicate confirmation button to ${sender}`);
+              } catch (err: any) {
+                addLog('error', `Failed to send duplicate confirmation button message: ${err.message}`);
+                await sendAndLogTextMessage(sender, intent.reply);
+              }
+            } else {
+              await sendAndLogTextMessage(sender, intent.reply || "Mujhe samajh nahi aaya. Course code likhein (jaise CS302).");
+            }
             break;
         }
       }

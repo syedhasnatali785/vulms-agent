@@ -104,3 +104,38 @@ export async function downloadWhatsAppMedia(mediaId: string): Promise<{ buffer: 
     throw error;
   }
 }
+
+export async function sendButtonMessage(
+  to: string,
+  bodyText: string,
+  buttons: Array<{ id: string; title: string }>
+) {
+  try {
+    const response = await whatsappApi.post('/messages', {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to,
+      type: 'interactive',
+      interactive: {
+        type: 'button',
+        body: {
+          text: bodyText,
+        },
+        action: {
+          buttons: buttons.map((btn) => ({
+            type: 'reply',
+            reply: {
+              id: btn.id,
+              title: btn.title.substring(0, 20), // WhatsApp button title limit is 20 chars
+            },
+          })),
+        },
+      },
+    });
+    return response.data;
+  } catch (error: any) {
+    console.error('Error sending WhatsApp button message:', error.response?.data || error.message);
+    throw error;
+  }
+}
+
