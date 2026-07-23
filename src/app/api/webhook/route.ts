@@ -4,7 +4,7 @@ import { downloadWhatsAppMedia, sendTextMessage, sendMediaMessage, sendButtonMes
 import { uploadFileToR2, getFileUrl, downloadFileContentFromR2 } from '@/lib/r2';
 import { processUserIntent, classifyAdminReview } from '@/lib/ai';
 import { searchGDriveFiles } from '@/lib/gdrive';
-import { isMidtermFile, isFinalTermFile } from '@/lib/fileFilters';
+import { isMidtermFile, isFinalTermFile, isAllowedForStudent } from '@/lib/fileFilters';
 
 export const maxDuration = 10;
 export const dynamic = 'force-dynamic';
@@ -174,6 +174,13 @@ async function sendAndLogTextMessage(to: string, text: string) {
 }
 
 async function sendFileToUser(sender: string, file: any, isSenderAdmin: boolean) {
+  if (!isSenderAdmin) {
+    if (!isAllowedForStudent(file.filename)) {
+      addLog('warn', `Blocked sending DB file "${file.filename}" to student (Strict Policy: Only Final Term files allowed)`);
+      return;
+    }
+  }
+
   // Plain-text reviews are stored as text/plain — send content as a WhatsApp text
   // message instead of a document attachment so students receive readable text.
   if (file.mime_type && file.mime_type.startsWith('text/plain')) {
@@ -198,7 +205,6 @@ async function sendFileToUser(sender: string, file: any, isSenderAdmin: boolean)
     }
   }
 
-  // DB files are uploaded by admins, so standard users should be allowed to receive them on demand.
   const fileUrl = await getFileUrl(file.r2_key);
   const mediaType = file.mime_type.startsWith('image') ? 'image'
     : file.mime_type.startsWith('video') ? 'video'
@@ -209,8 +215,8 @@ async function sendFileToUser(sender: string, file: any, isSenderAdmin: boolean)
 
 async function sendGDriveFileToUser(sender: string, file: any, isSenderAdmin: boolean) {
   if (!isSenderAdmin) {
-    if (isMidtermFile(file.name) || !isFinalTermFile(file.name)) {
-      addLog('warn', `Blocked sending GDrive file "${file.name}" because it is not a final term file`);
+    if (!isAllowedForStudent(file.name)) {
+      addLog('warn', `Blocked sending GDrive file "${file.name}" to student (Strict Policy: Only Final Term files allowed)`);
       return;
     }
   }
@@ -671,7 +677,7 @@ export async function POST(request: Request) {
             try {
               const rawDriveFiles = await searchGDriveFiles(searchQuery, contextTerms);
               for (const f of rawDriveFiles) {
-                const allowed = isSenderAdmin || (!isMidtermFile(f.name) && isFinalTermFile(f.name));
+                const allowed = isSenderAdmin || isAllowedForStudent(f.name);
                 if (!allowed) continue;
 
                 // Apply exclusion filter
@@ -690,8 +696,8 @@ export async function POST(request: Request) {
 
             for (const f of dbFiles) {
               const nameLower = f.filename.toLowerCase();
-              if (isAllSearch) {
-                if (isMidtermFile(f.filename) || !isFinalTermFile(f.filename)) {
+              if (!isSenderAdmin || isAllSearch) {
+                if (!isAllowedForStudent(f.filename)) {
                   continue;
                 }
               }
@@ -703,8 +709,8 @@ export async function POST(request: Request) {
 
             for (const f of driveFiles) {
               const nameLower = f.name.toLowerCase();
-              if (isAllSearch) {
-                if (isMidtermFile(f.name) || !isFinalTermFile(f.name)) {
+              if (!isSenderAdmin || isAllSearch) {
+                if (!isAllowedForStudent(f.name)) {
                   continue;
                 }
               }
@@ -840,7 +846,7 @@ export async function POST(request: Request) {
                 try {
                   const raw = await searchGDriveFiles(sq, ctx);
                   for (const f of raw) {
-                    const allowed = isSenderAdmin || (!isMidtermFile(f.name) && isFinalTermFile(f.name));
+                    const allowed = isSenderAdmin || isAllowedForStudent(f.name);
                     if (!allowed) continue;
                     const nl = f.name.toLowerCase();
                     if (excl.some((ex: string) => nl.includes(ex.toLowerCase()))) continue;
@@ -854,8 +860,8 @@ export async function POST(request: Request) {
                 const merged: { source: 'db' | 'gdrive'; file: any; name: string }[] = [];
                 for (const f of dbFiles) {
                   const nl = f.filename.toLowerCase();
-                  if (localIsAllSearch) {
-                    if (isMidtermFile(f.filename) || !isFinalTermFile(f.filename)) {
+                  if (!isSenderAdmin || localIsAllSearch) {
+                    if (!isAllowedForStudent(f.filename)) {
                       continue;
                     }
                   }
@@ -863,8 +869,8 @@ export async function POST(request: Request) {
                 }
                 for (const f of driveFiles) {
                   const nl = f.name.toLowerCase();
-                  if (localIsAllSearch) {
-                    if (isMidtermFile(f.name) || !isFinalTermFile(f.name)) {
+                  if (!isSenderAdmin || localIsAllSearch) {
+                    if (!isAllowedForStudent(f.name)) {
                       continue;
                     }
                   }
@@ -958,6 +964,10 @@ export async function POST(request: Request) {
             addLog('info', `Keyword search: [${finalKeywords.join(', ')}]`);
 
             let kwFiles = await getFilesByKeywords(finalKeywords);
+
+            if (!isSenderAdmin) {
+              kwFiles = kwFiles.filter((f: any) => isAllowedForStudent(f.filename));
+            }
 
             if (kwFiles.length === 0) {
               await sendAndLogTextMessage(sender, `❌ Koi file nahi mili: "${rawKeywords.join(', ')}"`);

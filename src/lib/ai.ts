@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { getAvailableFiles } from './supabase';
-import { isMidtermFile, isFinalTermFile } from './fileFilters';
+import { isMidtermFile, isFinalTermFile, isAllowedForStudent } from './fileFilters';
 
 const AI_MODEL = process.env.CLOUDFLARE_AI_MODEL || '@cf/qwen/qwen3-30b-a3b-fp8';
 
@@ -102,7 +102,7 @@ export async function runCloudflareAI(messages: any[]): Promise<string> {
 export async function processUserIntent(userMessage: string, isAdmin: boolean, history: any[] = []) {
   let files = await getAvailableFiles();
   if (!isAdmin) {
-    files = files.filter((f: any) => !isMidtermFile(f.filename) && isFinalTermFile(f.filename));
+    files = files.filter((f: any) => isAllowedForStudent(f.filename));
   }
   const fileNames = files.map((f: any) => `${f.filename} (ID: ${f.id})`).join(', ');
 
